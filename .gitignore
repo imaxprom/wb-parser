@@ -1,0 +1,10 @@
+.env
+data/
+venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+downloaded_files/
+*.bak
+test_*.py
