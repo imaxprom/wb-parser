@@ -61,6 +61,12 @@ ssh wb-parser "~/wb-parser/deploy.sh"
 - Сервис: `ssh-tunnel-telegram.service` (автозапуск, автореконнект)
 - Настройка в `.env`: `TELEGRAM_PROXY=socks5://127.0.0.1:1080`
 
+## Германская VPS (SSH-туннель)
+- IP: `89.125.73.111`, root, порт 22
+- На ней Amnezia (Docker, UDP 1274) — НЕ ТРОГАТЬ
+- SSH-туннель wb-parser использует только SSH — конфликтов с Amnezia нет
+- Эту VPS могут использовать и другие проекты для SSH-туннелей
+
 ## .env на VPS (НЕ в Git)
 ```
 WB_PARSER_BOT_TOKEN=...
