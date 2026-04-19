@@ -627,9 +627,13 @@ async def fetch_brand(sku: str) -> str:
 RECOM_URL = "https://www.wildberries.ru/__internal/recom/recom/ru/common/v8/search"
 
 
-async def _recom_search(session: aiohttp.ClientSession, competitor_sku: str,
+async def _recom_search(competitor_sku: str,
                         dest: str = WB_DEST) -> tuple[list[dict], bool]:
-    """Fetch recommendation shelf for a competitor. Returns (products, is_error)."""
+    """Fetch recommendation shelf via curl_cffi with chrome TLS impersonation
+    and full buyer auth (Bearer + PoW + wbaas) — same as proxy_positions."""
+    import proxy_positions
+    from curl_cffi import requests as curl_requests
+
     params = {
         "appType": "1",
         "curr": "rub",
@@ -640,29 +644,33 @@ async def _recom_search(session: aiohttp.ClientSession, competitor_sku: str,
         "query": f"похожие {competitor_sku}",
         "resultset": "catalog",
     }
-    for attempt in range(2):
+
+    def do_request() -> tuple[list[dict], bool]:
+        headers = proxy_positions._build_headers("__direct__")
         try:
-            async with session.get(
-                RECOM_URL, params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    return data.get("products", []), False
-                elif resp.status == 429:
-                    if attempt == 0:
-                        await asyncio.sleep(1)
-                        continue
-                    return [], True
-                else:
-                    logger.warning(f"recom {resp.status} for '{competitor_sku}'")
-                    return [], True
-        except Exception as e:
-            logger.error(f"recom error '{competitor_sku}': {e}")
-            if attempt == 0:
-                await asyncio.sleep(1)
-                continue
+            resp = curl_requests.get(
+                RECOM_URL, params=params, headers=headers,
+                impersonate="chrome", timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("products", []), False
+            if resp.status_code in (429, 451, 498):
+                logger.warning("recom %d anti-bot/rate for '%s'",
+                               resp.status_code, competitor_sku)
+                return [], True
+            logger.warning("recom %d for '%s'", resp.status_code, competitor_sku)
             return [], True
+        except Exception as e:
+            logger.error("recom error '%s': %s", competitor_sku, e)
+            return [], True
+
+    for attempt in range(2):
+        products, is_error = await asyncio.to_thread(do_request)
+        if not is_error:
+            return products, False
+        if attempt == 0:
+            await asyncio.sleep(1)
     return [], True
 
 
@@ -672,23 +680,20 @@ async def recom_scan_all(our_sku: str, competitors: list[str],
 
     Returns: {competitor_sku: {"position": N or None, "error": bool}}
     """
-    headers, token_row = _build_headers()
     results = {}
+    for comp_sku in competitors:
+        products, is_error = await _recom_search(comp_sku, dest)
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for comp_sku in competitors:
-            products, is_error = await _recom_search(session, comp_sku, dest)
+        if is_error:
+            results[comp_sku] = {"position": None, "error": True}
+        else:
+            position = None
+            for i, p in enumerate(products):
+                if str(p.get("id")) == our_sku:
+                    position = i + 1
+                    break
+            results[comp_sku] = {"position": position, "error": False}
 
-            if is_error:
-                results[comp_sku] = {"position": None, "error": True}
-            else:
-                position = None
-                for i, p in enumerate(products):
-                    if str(p.get("id")) == our_sku:
-                        position = i + 1
-                        break
-                results[comp_sku] = {"position": position, "error": False}
-
-            await asyncio.sleep(REQUEST_DELAY)
+        await asyncio.sleep(REQUEST_DELAY)
 
     return results
