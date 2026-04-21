@@ -498,12 +498,17 @@ async def run_parse(telegram_id: int, article_id: int, sku: str, queries: list[d
 _GEO_SEMAPHORE = asyncio.Semaphore(3)
 
 
-async def _geo_scan_region(session: aiohttp.ClientSession, sku: str, query: str,
+async def _geo_scan_region(sku: str, query: str,
                            region: dict, pages_depth: int) -> dict:
-    """Scan one region for a SKU. Runs under semaphore."""
+    """Scan one region for a SKU via curl_cffi (chrome TLS) — обходит anti-bot.
+    Без Bearer, чтобы dest не игнорировался в пользу домашнего региона."""
+    import proxy_positions
+    from curl_cffi import requests as curl_requests
+
     async with _GEO_SEMAPHORE:
-        position = None
-        for page in range(1, pages_depth + 1):
+        def fetch_page(page: int) -> tuple[int, list[dict]]:
+            """Returns (status_code, products). status=0 on exception."""
+            headers = proxy_positions._build_headers("__direct__", with_bearer=False)
             params = {
                 "appType": WB_APP_TYPE,
                 "curr": "rub",
@@ -515,33 +520,29 @@ async def _geo_scan_region(session: aiohttp.ClientSession, sku: str, query: str,
                 "sort": "popular",
                 "spp": "30",
             }
-            for attempt in range(2):
-                try:
-                    async with session.get(
-                        WB_SEARCH_URL, params=params,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        if resp.status == 429:
-                            if attempt == 0:
-                                await asyncio.sleep(1)
-                                continue
-                            break
-                        if resp.status != 200:
-                            break
-                        data = await resp.json(content_type=None)
-                        products = data.get("products", [])
-                        for i, p in enumerate(products):
-                            if str(p.get("id")) == sku:
-                                position = (page - 1) * WB_ITEMS_PER_PAGE + i + 1
-                                break
-                    break
-                except Exception as e:
-                    logger.error(f"geo_scan error {region['short']}: {e}")
-                    if attempt == 0:
-                        await asyncio.sleep(1)
-                        continue
-                    break
+            try:
+                resp = curl_requests.get(
+                    WB_SEARCH_URL, params=params, headers=headers,
+                    impersonate="chrome", timeout=10,
+                )
+                if resp.status_code == 200:
+                    return 200, resp.json().get("products", [])
+                return resp.status_code, []
+            except Exception as e:
+                logger.error("geo_scan %s exception: %s", region["short"], e)
+                return 0, []
 
+        position = None
+        for page in range(1, pages_depth + 1):
+            status, products = await asyncio.to_thread(fetch_page, page)
+            if status != 200:
+                logger.warning("geo_scan %s page %d HTTP %d for '%s'",
+                               region["short"], page, status, query)
+                break
+            for i, p in enumerate(products):
+                if str(p.get("id")) == sku:
+                    position = (page - 1) * WB_ITEMS_PER_PAGE + i + 1
+                    break
             if position is not None:
                 break
             await asyncio.sleep(0.2)
@@ -555,15 +556,8 @@ async def _geo_scan_region(session: aiohttp.ClientSession, sku: str, query: str,
 
 async def geo_scan(sku: str, query: str, regions: list[dict], pages_depth: int = 5) -> list[dict]:
     """Scan one SKU + query across multiple regions in parallel. Returns [{short, name, position}, ...]."""
-    # No Bearer token for geo scan — it personalizes results and hides items in some regions
-    headers = {**HEADERS, "User-Agent": random.choice(USER_AGENTS)}
-    wbaas = _get_wbaas_token()
-    if wbaas:
-        headers["Cookie"] = f"x_wbaas_token={wbaas}"
-
-    async with aiohttp.ClientSession(headers=headers) as session:
-        tasks = [_geo_scan_region(session, sku, query, r, pages_depth) for r in regions]
-        results = await asyncio.gather(*tasks)
+    tasks = [_geo_scan_region(sku, query, r, pages_depth) for r in regions]
+    results = await asyncio.gather(*tasks)
 
     # Preserve region order
     order = {r["short"]: i for i, r in enumerate(regions)}

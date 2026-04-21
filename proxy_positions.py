@@ -195,8 +195,12 @@ def _load_wb_session():
         logger.warning("No wb_session.json — running without auth")
 
 
-def _build_headers(token_key: str) -> dict:
-    """Build request headers with full auth if available."""
+def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
+    """Build request headers with full auth if available.
+
+    with_bearer=False — для гео-сканера: Bearer привязывает результаты
+    к домашнему региону покупателя и игнорирует параметр dest.
+    """
     headers = {
         "User-Agent": _UA,
         "Accept": "*/*",
@@ -211,22 +215,23 @@ def _build_headers(token_key: str) -> dict:
     ls = _wb_session.get("localStorage", {})
     cookies = _wb_session.get("cookies", {})
 
-    # Bearer token
-    td_raw = ls.get("wbx__tokenData", "")
-    if td_raw:
-        try:
-            td = json.loads(td_raw)
-            bearer = td.get("token", "")
-            if bearer:
-                headers["Authorization"] = f"Bearer {bearer}"
-                # Extract userid from JWT
-                import base64
-                raw = bearer.split(".")[1]
-                raw += "=" * (4 - len(raw) % 4)
-                jwt_data = json.loads(base64.urlsafe_b64decode(raw))
-                headers["x-userid"] = str(jwt_data.get("user", "0"))
-        except Exception as e:
-            logger.warning("Failed to parse Bearer: %s", e)
+    # Bearer token (skip for geo scan — would lock results to home region)
+    if with_bearer:
+        td_raw = ls.get("wbx__tokenData", "")
+        if td_raw:
+            try:
+                td = json.loads(td_raw)
+                bearer = td.get("token", "")
+                if bearer:
+                    headers["Authorization"] = f"Bearer {bearer}"
+                    # Extract userid from JWT
+                    import base64
+                    raw = bearer.split(".")[1]
+                    raw += "=" * (4 - len(raw) % 4)
+                    jwt_data = json.loads(base64.urlsafe_b64decode(raw))
+                    headers["x-userid"] = str(jwt_data.get("user", "0"))
+            except Exception as e:
+                logger.warning("Failed to parse Bearer: %s", e)
 
     # PoW token
     pow_raw = ls.get("session-pow-token", "")
