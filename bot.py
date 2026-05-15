@@ -2,10 +2,14 @@
 
 import asyncio
 import html
+import json
 import logging
 import os
+import re
 import tempfile
+import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
@@ -115,13 +119,17 @@ class AddUser(StatesGroup):
 class AddCompetitor(StatesGroup):
     waiting_sku = State()
 
+class UpdateWbSession(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+
 
 # --- Menu button texts (used to prevent FSM handlers from intercepting keyboard presses) ---
 
 MENU_TEXTS = frozenset({
     "Поиск", "Авто", "📈 Графики",
     "📋 Артикулы", "📂 Загрузить XLSX", "🔔 Уведомления",
-    "🌍 Гео-сканер", "Полки",
+    "🌍 Гео-сканер", "Полки", "⚙️ Настройки",
 })
 
 # --- Keyboards ---
@@ -165,6 +173,314 @@ def article_actions_kb(article_id: int) -> InlineKeyboardMarkup:
 def escape(text: str) -> str:
     """Escape HTML special characters."""
     return html.escape(text)
+
+
+# --- WB session refresh via Telegram ---
+
+@dataclass
+class WbSessionJob:
+    phone: str
+    chat_id: int
+    code_event: threading.Event = field(default_factory=threading.Event)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    code: str = ""
+    task: asyncio.Task | None = None
+    started_at: float = field(default_factory=time.time)
+
+
+_wb_session_jobs: dict[int, WbSessionJob] = {}
+
+
+def _normalize_ru_phone(raw: str) -> str | None:
+    """Return WB-friendly Russian phone digits: 79151234567."""
+    digits = re.sub(r"\D+", "", raw or "")
+    if len(digits) == 10 and digits.startswith("9"):
+        return "7" + digits
+    if len(digits) == 11 and digits.startswith("8"):
+        return "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return digits
+    return None
+
+
+def _format_ru_phone(phone: str) -> str:
+    if len(phone) == 11 and phone.startswith("7"):
+        return f"+7 {phone[1:4]} {phone[4:7]}-{phone[7:9]}-{phone[9:11]}"
+    return phone
+
+
+def _validate_wb_code(raw: str) -> str | None:
+    digits = re.sub(r"\D+", "", raw or "")
+    return digits if len(digits) == 6 else None
+
+
+def _schedule_status(loop: asyncio.AbstractEventLoop, chat_id: int, text: str):
+    async def send():
+        try:
+            await bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("WB session status send failed: %s", e)
+
+    asyncio.run_coroutine_threadsafe(send(), loop)
+
+
+def _visible_button_by_text(page, needle: str):
+    for button in page.query_selector_all("button"):
+        try:
+            if button.is_visible() and needle.lower() in button.inner_text().lower():
+                return button
+        except Exception:
+            continue
+    return None
+
+
+def _safe_body_text(page, limit: int = 1000) -> str:
+    try:
+        return re.sub(r"\s+", " ", page.inner_text("body"))[:limit]
+    except Exception:
+        return ""
+
+
+def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
+                               status_cb) -> dict:
+    """Run WB buyer login in a blocking Playwright thread."""
+    from playwright.sync_api import sync_playwright
+
+    status_cb("🌐 Открываю страницу входа WB...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/141.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+            )
+            ctx.add_init_script(
+                'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+            )
+            page = ctx.new_page()
+            page.goto("https://www.wildberries.ru/security/login", timeout=30000)
+
+            status_cb("🛡 Прохожу антибот-проверку WB...")
+            page.wait_for_selector(
+                'input[name="phoneNumber"]:not([type="radio"])',
+                timeout=70000,
+            )
+
+            if job.cancel_event.is_set():
+                raise RuntimeError("Обновление отменено.")
+
+            phone_input = page.locator(
+                'input[name="phoneNumber"]:not([type="radio"])'
+            ).first
+            phone_input.fill(phone)
+            page.wait_for_timeout(800)
+
+            rendered_phone = phone_input.input_value()
+            status_cb(f"📱 Номер введён: <b>{escape(rendered_phone)}</b>")
+
+            button = _visible_button_by_text(page, "Получить")
+            if not button:
+                raise RuntimeError("Не нашёл кнопку «Получить код» на странице WB.")
+            button.click()
+
+            status_cb("📨 Запрашиваю код WB...")
+            code_screen = False
+            last_text = ""
+            for _ in range(90):
+                if job.cancel_event.is_set():
+                    raise RuntimeError("Обновление отменено.")
+                page.wait_for_timeout(1000)
+                last_text = _safe_body_text(page, 1600)
+                if "Некорректный формат номера" in last_text:
+                    raise RuntimeError(
+                        "WB отклонил номер как некорректный. "
+                        "Попробуй формат +7 999 123-45-67 или 79991234567."
+                    )
+                if (
+                    "Откройте уведомление" in last_text
+                    or "Вам пришло уведомление" in last_text
+                    or "Код" in last_text
+                    or page.query_selector('input[inputmode="numeric"]')
+                ):
+                    code_screen = True
+                    break
+
+            if not code_screen:
+                raise RuntimeError(
+                    "WB не открыл экран ввода кода. Последний текст страницы: "
+                    + last_text[:500]
+                )
+
+            status_cb(
+                "✅ WB запросил код. Открой приложение Wildberries или SMS "
+                "и отправь сюда 6 цифр."
+            )
+
+            # Wait up to 5 minutes for Telegram code input.
+            if not job.code_event.wait(timeout=300):
+                raise RuntimeError("Истёк таймаут ожидания кода WB.")
+            if job.cancel_event.is_set():
+                raise RuntimeError("Обновление отменено.")
+
+            code = job.code
+            status_cb("🔐 Ввожу код WB...")
+
+            code_inputs = page.query_selector_all('input[inputmode="numeric"]')
+            if not code_inputs:
+                code_inputs = page.query_selector_all('input[type="tel"]')
+            if not code_inputs:
+                code_inputs = page.query_selector_all('input[type="number"]')
+
+            if len(code_inputs) >= 4:
+                for i, ch in enumerate(code):
+                    if i < len(code_inputs):
+                        code_inputs[i].fill(ch)
+                        page.wait_for_timeout(100)
+            elif len(code_inputs) == 1:
+                code_inputs[0].fill(code)
+            else:
+                page.keyboard.type(code, delay=120)
+
+            page.wait_for_timeout(10000)
+            body_after_code = _safe_body_text(page, 1200)
+            if (
+                "неверный код" in body_after_code.lower()
+                or "ошибка" in body_after_code.lower()
+            ):
+                raise RuntimeError("WB не принял код. Проверь код и запусти обновление заново.")
+
+            status_cb("💾 Сохраняю новую WB-сессию...")
+            page.goto("https://www.wildberries.ru/", timeout=30000)
+            page.wait_for_timeout(10000)
+
+            cookies_list = ctx.cookies()
+            cookies = {c["name"]: c["value"] for c in cookies_list}
+            ls_data = page.evaluate("""() => {
+                var d = {};
+                for (var i = 0; i < localStorage.length; i++) {
+                    var k = localStorage.key(i);
+                    d[k] = localStorage.getItem(k);
+                }
+                return d;
+            }""")
+
+            sys_auth = ls_data.get("_sys_auth", "")
+            has_bearer = bool(ls_data.get("wbx__tokenData"))
+            has_pow = bool(ls_data.get("session-pow-token"))
+            has_wbaas = bool(cookies.get("x_wbaas_token"))
+
+            if not has_bearer or not has_pow or not has_wbaas:
+                raise RuntimeError(
+                    "Логин не дал полный набор WB-сессии: "
+                    f"Bearer={has_bearer}, PoW={has_pow}, wbaas={has_wbaas}."
+                )
+
+            session_data = {
+                "cookies": cookies,
+                "cookies_full": [dict(c) for c in cookies_list],
+                "localStorage": ls_data,
+                "saved_at": time.time(),
+            }
+            wb_session_path = os.path.join(config.DATA_DIR, "wb_session.json")
+            wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
+            with open(wb_session_path, "w") as f:
+                json.dump(session_data, f, indent=2)
+            ctx.storage_state(path=wb_state_path)
+
+            return {
+                "sys_auth": sys_auth,
+                "bearer": has_bearer,
+                "pow": has_pow,
+                "wbaas": has_wbaas,
+                "wbauid": cookies.get("_wbauid", ""),
+            }
+        finally:
+            browser.close()
+
+
+def _verify_current_wb_session_sync() -> tuple[int, int]:
+    """Return (HTTP status, products count) for current proxy_positions auth."""
+    from curl_cffi import requests as curl_requests
+    import proxy_positions
+
+    proxy_positions._load_token_cache()
+    proxy_positions._load_wb_session()
+    headers = proxy_positions._build_headers("__direct__", with_bearer=True)
+    params = {
+        "ab_testing": "false",
+        "appType": "1",
+        "curr": "rub",
+        "dest": config.WB_DEST,
+        "hide_dflags": "131072",
+        "hide_dtype": "10;14",
+        "inheritFilters": "false",
+        "lang": "ru",
+        "query": "трусы женские",
+        "resultset": "catalog",
+        "sort": "popular",
+        "spp": "31",
+        "suppressSpellcheck": "false",
+        "limit": "300",
+        "page": "1",
+    }
+    resp = curl_requests.get(
+        proxy_positions.SEARCH_URL,
+        params=params,
+        headers=headers,
+        impersonate="chrome",
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        return resp.status_code, 0
+    return resp.status_code, len(resp.json().get("products", []))
+
+
+async def _run_wb_session_job(uid: int, job: WbSessionJob):
+    loop = asyncio.get_running_loop()
+
+    def status(text: str):
+        _schedule_status(loop, job.chat_id, text)
+
+    try:
+        result = await asyncio.to_thread(
+            _run_wb_session_login_sync,
+            job.phone,
+            job,
+            status,
+        )
+        status("🧪 Проверяю новую сессию на поисковом endpoint WB...")
+        status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
+        if status_code != 200:
+            raise RuntimeError(f"WB всё ещё отвечает HTTP {status_code} после обновления.")
+
+        await bot.send_message(
+            job.chat_id,
+            "✅ <b>WB-сессия обновлена</b>\n\n"
+            f"Аккаунт: <code>{escape(str(result.get('sys_auth') or 'unknown'))}</code>\n"
+            f"Проверка WB: HTTP 200, товаров в ответе: <b>{products_count}</b>\n\n"
+            "Бот уже подхватил новую сессию, перезапуск сервиса не нужен.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("WB session update failed")
+        await bot.send_message(
+            job.chat_id,
+            f"⚠️ <b>Не удалось обновить WB-сессию</b>\n\n{escape(str(e))}",
+            parse_mode="HTML",
+        )
+    finally:
+        current = _wb_session_jobs.get(uid)
+        if current is job:
+            _wb_session_jobs.pop(uid, None)
 
 
 # --- /start ---
@@ -288,6 +604,77 @@ async def add_token_process(message: Message, state: FSMContext):
         )
     else:
         await message.answer("Ошибка при добавлении токена.", reply_markup=main_kb())
+    await state.clear()
+
+
+@router.message(UpdateWbSession.waiting_phone, ~F.text.in_(MENU_TEXTS))
+async def wb_session_phone_process(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not db.is_owner(uid):
+        await message.answer("⛔ Обновлять WB-сессию может только владелец бота.")
+        await state.clear()
+        return
+
+    phone = _normalize_ru_phone(message.text)
+    if not phone:
+        await message.answer(
+            "Введи российский номер в одном из форматов:\n"
+            "<code>9159166999</code>\n"
+            "<code>89159166999</code>\n"
+            "<code>+7 915 916-69-99</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    old_job = _wb_session_jobs.get(uid)
+    if old_job:
+        old_job.cancel_event.set()
+        old_job.code_event.set()
+
+    await state.set_state(UpdateWbSession.waiting_code)
+    await state.update_data(phone=phone)
+
+    job = WbSessionJob(phone=phone, chat_id=message.chat.id)
+    _wb_session_jobs[uid] = job
+    task = asyncio.create_task(_run_wb_session_job(uid, job))
+    job.task = task
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    await message.answer(
+        "▶️ <b>Запускаю обновление WB-сессии</b>\n\n"
+        f"Номер: <b>{escape(_format_ru_phone(phone))}</b>\n\n"
+        "Я буду писать статусы здесь. Когда WB пришлёт код в приложение или SMS, "
+        "отправь сюда 6 цифр.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")],
+        ]),
+    )
+
+
+@router.message(UpdateWbSession.waiting_code, ~F.text.in_(MENU_TEXTS))
+async def wb_session_code_process(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    code = _validate_wb_code(message.text)
+    if not code:
+        await message.answer("Код должен состоять из 6 цифр. Пришли код ещё раз.")
+        return
+
+    job = _wb_session_jobs.get(uid)
+    if not job:
+        await message.answer("Активного обновления WB-сессии нет. Запусти обновление заново.")
+        await state.clear()
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    job.code = code
+    job.code_event.set()
+    await message.answer("✅ Код получен, передаю его WB...")
     await state.clear()
 
 
@@ -1192,6 +1579,7 @@ async def show_settings(message: Message, state: FSMContext):
         ])
         if db.is_owner(uid):
             kb.inline_keyboard.append([InlineKeyboardButton(text="🔑 Токены WB", callback_data="tokens_menu")])
+            kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")])
             kb.inline_keyboard.append([InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")])
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
@@ -1289,6 +1677,7 @@ async def go_settings(callback: CallbackQuery):
     ])
     if db.is_owner(uid):
         kb.inline_keyboard.append([InlineKeyboardButton(text="🔑 Токены WB", callback_data="tokens_menu")])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")])
         kb.inline_keyboard.append([InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
@@ -1387,7 +1776,11 @@ async def set_depth_start(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "tokens_menu")
 async def tokens_menu(callback: CallbackQuery):
     tokens = db.get_wb_tokens()
-    text = "🔑 <b>Токены WB (WBTokenV3)</b>\n\n"
+    text = (
+        "🔑 <b>Токены WB (WBTokenV3)</b>\n\n"
+        "Текущий парсер рекламы использует WB-сессию из файла, "
+        "а не эти токены. Для рекламы используй обновление WB-сессии.\n\n"
+    )
 
     if not tokens:
         text += "Нет токенов. Добавь токен авторизованного пользователя WB."
@@ -1402,7 +1795,10 @@ async def tokens_menu(callback: CallbackQuery):
                 text += f"   Ошибка: {t['last_error']}\n"
             text += "\n"
 
-    buttons = [[InlineKeyboardButton(text="➕ Добавить токен", callback_data="token_add")]]
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")],
+        [InlineKeyboardButton(text="➕ Добавить токен", callback_data="token_add")],
+    ]
     for t in tokens:
         label = t.get("label") or f"#{t['id']}"
         row = []
@@ -1415,6 +1811,63 @@ async def tokens_menu(callback: CallbackQuery):
 
     await callback.message.edit_text(text, parse_mode="HTML",
                                       reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "wb_session_update")
+async def wb_session_update_start(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if not db.is_owner(uid):
+        await callback.answer("Доступно только владельцу", show_alert=True)
+        return
+
+    active = _wb_session_jobs.get(uid)
+    if active:
+        await callback.message.edit_text(
+            "🔄 <b>Обновление WB-сессии уже запущено</b>\n\n"
+            f"Номер: <b>{escape(_format_ru_phone(active.phone))}</b>\n"
+            "Пришли сюда 6-значный код из приложения/SMS или отмени процесс.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_settings")],
+            ]),
+        )
+        await state.set_state(UpdateWbSession.waiting_code)
+        await callback.answer()
+        return
+
+    await state.set_state(UpdateWbSession.waiting_phone)
+    await callback.message.edit_text(
+        "🔄 <b>Обновить WB-сессию</b>\n\n"
+        "Пришли номер телефона аккаунта WB. Можно в любом формате:\n"
+        "<code>9159166999</code>\n"
+        "<code>89159166999</code>\n"
+        "<code>+7 915 916-69-99</code>\n\n"
+        "После этого я открою WB, запрошу код и попрошу отправить 6 цифр сюда.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_settings")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "wb_session_cancel")
+async def wb_session_cancel(callback: CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    job = _wb_session_jobs.pop(uid, None)
+    if job:
+        job.cancel_event.set()
+        job.code_event.set()
+    await state.clear()
+    await callback.message.edit_text(
+        "Обновление WB-сессии отменено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Настройки", callback_data="go_settings")],
+        ]),
+    )
     await callback.answer()
 
 
