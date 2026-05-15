@@ -107,9 +107,6 @@ class SetDepth(StatesGroup):
 class SetAlertThreshold(StatesGroup):
     waiting_value = State()
 
-class AddToken(StatesGroup):
-    waiting_token = State()
-
 class RenameArticle(StatesGroup):
     waiting_name = State()
 
@@ -577,33 +574,6 @@ async def add_article_fsm(message: Message, state: FSMContext):
             f"Артикул {sku} уже существует.",
             reply_markup=article_actions_kb(art_id),
         )
-    await state.clear()
-
-
-@router.message(AddToken.waiting_token, ~F.text.in_(MENU_TEXTS))
-async def add_token_process(message: Message, state: FSMContext):
-    token = message.text.strip()
-    # Delete the message with token for security
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    if len(token) < 50:
-        await message.answer("Токен слишком короткий. Попробуй ещё раз.")
-        return
-
-    label = f"Token #{len(db.get_wb_tokens()) + 1}"
-    result = db.add_wb_token(token, label)
-    if result:
-        await message.answer(
-            f"✅ Токен добавлен: <b>{label}</b>\n"
-            f"Первые символы: <code>{token[:20]}...</code>",
-            parse_mode="HTML",
-            reply_markup=main_kb(),
-        )
-    else:
-        await message.answer("Ошибка при добавлении токена.", reply_markup=main_kb())
     await state.clear()
 
 
@@ -1567,18 +1537,12 @@ async def show_settings(message: Message, state: FSMContext):
             "⚙️ <b>Настройки</b>\n\n"
         )
 
-        if db.is_owner(uid):
-            tokens = db.get_wb_tokens()
-            active_tokens = [t for t in tokens if t["is_active"]]
-            text += f"🔑 Токенов WB: <b>{len(active_tokens)}</b> активных из {len(tokens)}\n"
-
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔍 Поиск", callback_data="settings_search"),
              InlineKeyboardButton(text="🏪 Полки", callback_data="settings_shelves")],
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="go_alerts")],
         ])
         if db.is_owner(uid):
-            kb.inline_keyboard.append([InlineKeyboardButton(text="🔑 Токены WB", callback_data="tokens_menu")])
             kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")])
             kb.inline_keyboard.append([InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")])
         await message.answer(text, parse_mode="HTML", reply_markup=kb)
@@ -1666,17 +1630,12 @@ async def go_settings(callback: CallbackQuery):
     uid = callback.from_user.id
     await callback.answer()
     text = "⚙️ <b>Настройки</b>\n\n"
-    if db.is_owner(uid):
-        tokens = db.get_wb_tokens()
-        active_tokens = [t for t in tokens if t["is_active"]]
-        text += f"🔑 Токенов WB: <b>{len(active_tokens)}</b> активных из {len(tokens)}\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Поиск", callback_data="settings_search"),
          InlineKeyboardButton(text="🏪 Полки", callback_data="settings_shelves")],
         [InlineKeyboardButton(text="🔔 Уведомления", callback_data="go_alerts")],
     ])
     if db.is_owner(uid):
-        kb.inline_keyboard.append([InlineKeyboardButton(text="🔑 Токены WB", callback_data="tokens_menu")])
         kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")])
         kb.inline_keyboard.append([InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")])
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
@@ -1771,49 +1730,6 @@ async def set_depth_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- WB Tokens ---
-
-@router.callback_query(F.data == "tokens_menu")
-async def tokens_menu(callback: CallbackQuery):
-    tokens = db.get_wb_tokens()
-    text = (
-        "🔑 <b>Токены WB (WBTokenV3)</b>\n\n"
-        "Текущий парсер рекламы использует WB-сессию из файла, "
-        "а не эти токены. Для рекламы используй обновление WB-сессии.\n\n"
-    )
-
-    if not tokens:
-        text += "Нет токенов. Добавь токен авторизованного пользователя WB."
-    else:
-        for t in tokens:
-            status = "✅" if t["is_active"] else "❌"
-            preview = t["token"][:15] + "..."
-            label = t.get("label") or f"#{t['id']}"
-            text += f"{status} <b>{label}</b>\n"
-            text += f"   <code>{preview}</code>\n"
-            if t.get("last_error"):
-                text += f"   Ошибка: {t['last_error']}\n"
-            text += "\n"
-
-    buttons = [
-        [InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")],
-        [InlineKeyboardButton(text="➕ Добавить токен", callback_data="token_add")],
-    ]
-    for t in tokens:
-        label = t.get("label") or f"#{t['id']}"
-        row = []
-        if t["is_active"]:
-            row.append(InlineKeyboardButton(text=f"❌ Выкл {label}", callback_data=f"token_off_{t['id']}"))
-        else:
-            row.append(InlineKeyboardButton(text=f"✅ Вкл {label}", callback_data=f"token_on_{t['id']}"))
-        row.append(InlineKeyboardButton(text=f"🗑 Удалить", callback_data=f"token_del_{t['id']}"))
-        buttons.append(row)
-
-    await callback.message.edit_text(text, parse_mode="HTML",
-                                      reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-
 @router.callback_query(F.data == "wb_session_update")
 async def wb_session_update_start(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
@@ -1869,45 +1785,6 @@ async def wb_session_cancel(callback: CallbackQuery, state: FSMContext):
         ]),
     )
     await callback.answer()
-
-
-@router.callback_query(F.data == "token_add")
-async def token_add_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AddToken.waiting_token)
-    await callback.message.answer(
-        "🔑 Отправь токен <b>WBTokenV3</b> от авторизованного пользователя WB.\n\n"
-        "Как получить:\n"
-        "1. Открой wildberries.ru (залогинься)\n"
-        "2. F12 → Application → Cookies\n"
-        "3. Скопируй значение <b>WBTokenV3</b>\n\n"
-        "Сообщение с токеном будет удалено автоматически.",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("token_on_"))
-async def token_activate(callback: CallbackQuery):
-    token_id = int(callback.data.replace("token_on_", ""))
-    db.set_wb_token_active(token_id, True)
-    await callback.answer("Токен активирован")
-    await tokens_menu(callback)
-
-
-@router.callback_query(F.data.startswith("token_off_"))
-async def token_deactivate(callback: CallbackQuery):
-    token_id = int(callback.data.replace("token_off_", ""))
-    db.set_wb_token_active(token_id, False)
-    await callback.answer("Токен выключен")
-    await tokens_menu(callback)
-
-
-@router.callback_query(F.data.startswith("token_del_"))
-async def token_delete(callback: CallbackQuery):
-    token_id = int(callback.data.replace("token_del_", ""))
-    db.remove_wb_token(token_id)
-    await callback.answer("Токен удалён")
-    await tokens_menu(callback)
 
 
 # --- Users ---
