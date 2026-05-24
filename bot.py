@@ -393,6 +393,19 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 json.dump(session_data, f, indent=2)
             ctx.storage_state(path=wb_state_path)
 
+            wbaas_cache_path = os.path.join(config.DATA_DIR, "wbaas_proxy_tokens.json")
+            try:
+                with open(wbaas_cache_path) as f:
+                    wbaas_cache = json.load(f)
+            except Exception:
+                wbaas_cache = {}
+            wbaas_cache["__direct__"] = {
+                "token": cookies["x_wbaas_token"],
+                "updated_at": time.time(),
+            }
+            with open(wbaas_cache_path, "w") as f:
+                json.dump(wbaas_cache, f, indent=2)
+
             return {
                 "sys_auth": sys_auth,
                 "bearer": has_bearer,
