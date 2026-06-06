@@ -292,6 +292,63 @@ def _save_wb_login_debug(page, reason: str) -> dict:
     return result
 
 
+def _save_wb_session_from_context(ctx, page) -> dict:
+    cookies_list = ctx.cookies()
+    cookies = {c["name"]: c["value"] for c in cookies_list}
+    ls_data = page.evaluate("""() => {
+        var d = {};
+        for (var i = 0; i < localStorage.length; i++) {
+            var k = localStorage.key(i);
+            d[k] = localStorage.getItem(k);
+        }
+        return d;
+    }""")
+
+    sys_auth = ls_data.get("_sys_auth", "")
+    has_bearer = bool(ls_data.get("wbx__tokenData"))
+    has_pow = bool(ls_data.get("session-pow-token"))
+    has_wbaas = bool(cookies.get("x_wbaas_token"))
+
+    if not has_bearer or not has_pow or not has_wbaas:
+        raise RuntimeError(
+            "Логин не дал полный набор WB-сессии: "
+            f"Bearer={has_bearer}, PoW={has_pow}, wbaas={has_wbaas}."
+        )
+
+    session_data = {
+        "cookies": cookies,
+        "cookies_full": [dict(c) for c in cookies_list],
+        "localStorage": ls_data,
+        "saved_at": time.time(),
+    }
+    wb_session_path = os.path.join(config.DATA_DIR, "wb_session.json")
+    wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
+    with open(wb_session_path, "w") as f:
+        json.dump(session_data, f, indent=2)
+    ctx.storage_state(path=wb_state_path)
+
+    wbaas_cache_path = os.path.join(config.DATA_DIR, "wbaas_proxy_tokens.json")
+    try:
+        with open(wbaas_cache_path) as f:
+            wbaas_cache = json.load(f)
+    except Exception:
+        wbaas_cache = {}
+    wbaas_cache["__direct__"] = {
+        "token": cookies["x_wbaas_token"],
+        "updated_at": time.time(),
+    }
+    with open(wbaas_cache_path, "w") as f:
+        json.dump(wbaas_cache, f, indent=2)
+
+    return {
+        "sys_auth": sys_auth,
+        "bearer": has_bearer,
+        "pow": has_pow,
+        "wbaas": has_wbaas,
+        "wbauid": cookies.get("_wbauid", ""),
+    }
+
+
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                                status_cb) -> dict:
     """Run WB buyer login in a blocking Playwright thread."""
@@ -338,6 +395,16 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 debug = _save_wb_login_debug(page, "wait_phone_input")
                 body = debug.get("body") or _safe_body_text(page, 700)
                 title = debug.get("title") or ""
+                if (
+                    "/lk" in (debug.get("url") or page.url)
+                    or "Профиль" in body
+                    or "Заказы" in body
+                ):
+                    status_cb(
+                        "✅ WB уже открыл личный кабинет. "
+                        "Сохраняю токены из текущего браузерного state..."
+                    )
+                    return _save_wb_session_from_context(ctx, page)
                 raise RuntimeError(
                     "WB не показал поле ввода телефона. "
                     f"URL={debug.get('url') or page.url}; title={title!r}. "
@@ -441,60 +508,7 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
             status_cb("💾 Сохраняю новую WB-сессию...")
             page.goto("https://www.wildberries.ru/", timeout=30000)
             page.wait_for_timeout(10000)
-
-            cookies_list = ctx.cookies()
-            cookies = {c["name"]: c["value"] for c in cookies_list}
-            ls_data = page.evaluate("""() => {
-                var d = {};
-                for (var i = 0; i < localStorage.length; i++) {
-                    var k = localStorage.key(i);
-                    d[k] = localStorage.getItem(k);
-                }
-                return d;
-            }""")
-
-            sys_auth = ls_data.get("_sys_auth", "")
-            has_bearer = bool(ls_data.get("wbx__tokenData"))
-            has_pow = bool(ls_data.get("session-pow-token"))
-            has_wbaas = bool(cookies.get("x_wbaas_token"))
-
-            if not has_bearer or not has_pow or not has_wbaas:
-                raise RuntimeError(
-                    "Логин не дал полный набор WB-сессии: "
-                    f"Bearer={has_bearer}, PoW={has_pow}, wbaas={has_wbaas}."
-                )
-
-            session_data = {
-                "cookies": cookies,
-                "cookies_full": [dict(c) for c in cookies_list],
-                "localStorage": ls_data,
-                "saved_at": time.time(),
-            }
-            wb_session_path = os.path.join(config.DATA_DIR, "wb_session.json")
-            with open(wb_session_path, "w") as f:
-                json.dump(session_data, f, indent=2)
-            ctx.storage_state(path=wb_state_path)
-
-            wbaas_cache_path = os.path.join(config.DATA_DIR, "wbaas_proxy_tokens.json")
-            try:
-                with open(wbaas_cache_path) as f:
-                    wbaas_cache = json.load(f)
-            except Exception:
-                wbaas_cache = {}
-            wbaas_cache["__direct__"] = {
-                "token": cookies["x_wbaas_token"],
-                "updated_at": time.time(),
-            }
-            with open(wbaas_cache_path, "w") as f:
-                json.dump(wbaas_cache, f, indent=2)
-
-            return {
-                "sys_auth": sys_auth,
-                "bearer": has_bearer,
-                "pow": has_pow,
-                "wbaas": has_wbaas,
-                "wbauid": cookies.get("_wbauid", ""),
-            }
+            return _save_wb_session_from_context(ctx, page)
         finally:
             browser.close()
 
