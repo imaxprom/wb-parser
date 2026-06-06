@@ -238,6 +238,60 @@ def _safe_body_text(page, limit: int = 1000) -> str:
         return ""
 
 
+def _save_wb_login_debug(page, reason: str) -> dict:
+    """Save the current WB login page for anti-bot/debug inspection."""
+    debug_dir = os.path.join(config.DATA_DIR, "wb_login_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "_", reason).strip("_")[:40] or "error"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = os.path.join(debug_dir, f"{stamp}_{safe_reason}")
+    html_path = base + ".html"
+    screenshot_path = base + ".png"
+
+    result = {
+        "html": html_path,
+        "screenshot": screenshot_path,
+        "url": "",
+        "title": "",
+        "body": "",
+    }
+
+    try:
+        result["url"] = page.url
+    except Exception:
+        pass
+    try:
+        result["title"] = page.title()
+    except Exception:
+        pass
+    try:
+        result["body"] = _safe_body_text(page, 1600)
+    except Exception:
+        pass
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except Exception as e:
+        logger.warning("WB login debug HTML save failed: %s", e)
+        result["html"] = ""
+    try:
+        page.screenshot(path=screenshot_path, full_page=True)
+    except Exception as e:
+        logger.warning("WB login debug screenshot save failed: %s", e)
+        result["screenshot"] = ""
+
+    logger.info(
+        "WB login debug saved: reason=%s url=%s title=%s html=%s screenshot=%s",
+        reason,
+        result["url"],
+        result["title"],
+        result["html"],
+        result["screenshot"],
+    )
+    return result
+
+
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                                status_cb) -> dict:
     """Run WB buyer login in a blocking Playwright thread."""
@@ -245,32 +299,52 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
 
     status_cb("🌐 Открываю страницу входа WB...")
     with sync_playwright() as p:
+        wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
         browser = p.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
         try:
-            ctx = browser.new_context(
-                user_agent=(
+            context_args = {
+                "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/141.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1920, "height": 1080},
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-            )
+                "viewport": {"width": 1920, "height": 1080},
+                "locale": "ru-RU",
+                "timezone_id": "Europe/Moscow",
+            }
+            if os.path.exists(wb_state_path):
+                context_args["storage_state"] = wb_state_path
+                status_cb("♻️ Использую сохранённый браузерный state WB.")
+
+            ctx = browser.new_context(**context_args)
             ctx.add_init_script(
                 'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
             )
             page = ctx.new_page()
+            page.goto("https://www.wildberries.ru/", timeout=30000)
+            page.wait_for_timeout(3000)
             page.goto("https://www.wildberries.ru/security/login", timeout=30000)
 
             status_cb("🛡 Прохожу антибот-проверку WB...")
-            page.wait_for_selector(
-                'input[name="phoneNumber"]:not([type="radio"])',
-                timeout=70000,
-            )
+            try:
+                page.wait_for_selector(
+                    'input[name="phoneNumber"]:not([type="radio"])',
+                    timeout=70000,
+                )
+            except Exception as e:
+                debug = _save_wb_login_debug(page, "wait_phone_input")
+                body = debug.get("body") or _safe_body_text(page, 700)
+                title = debug.get("title") or ""
+                raise RuntimeError(
+                    "WB не показал поле ввода телефона. "
+                    f"URL={debug.get('url') or page.url}; title={title!r}. "
+                    f"Похоже на антибот/блокировку страницы. Debug: "
+                    f"html={debug.get('html') or '-'}, screenshot={debug.get('screenshot') or '-'}. "
+                    f"Текст страницы: {body[:500]}"
+                ) from e
 
             if job.cancel_event.is_set():
                 raise RuntimeError("Обновление отменено.")
@@ -286,7 +360,12 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
 
             button = _visible_button_by_text(page, "Получить")
             if not button:
-                raise RuntimeError("Не нашёл кнопку «Получить код» на странице WB.")
+                debug = _save_wb_login_debug(page, "no_get_code_button")
+                raise RuntimeError(
+                    "Не нашёл кнопку «Получить код» на странице WB. "
+                    f"Debug: html={debug.get('html') or '-'}, "
+                    f"screenshot={debug.get('screenshot') or '-'}."
+                )
             button.click()
 
             status_cb("📨 Запрашиваю код WB...")
@@ -312,9 +391,12 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                     break
 
             if not code_screen:
+                debug = _save_wb_login_debug(page, "no_code_screen")
                 raise RuntimeError(
                     "WB не открыл экран ввода кода. Последний текст страницы: "
                     + last_text[:500]
+                    + f" Debug: html={debug.get('html') or '-'}, "
+                    + f"screenshot={debug.get('screenshot') or '-'}."
                 )
 
             status_cb(
@@ -353,6 +435,7 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 "неверный код" in body_after_code.lower()
                 or "ошибка" in body_after_code.lower()
             ):
+                _save_wb_login_debug(page, "code_rejected")
                 raise RuntimeError("WB не принял код. Проверь код и запусти обновление заново.")
 
             status_cb("💾 Сохраняю новую WB-сессию...")
@@ -388,7 +471,6 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 "saved_at": time.time(),
             }
             wb_session_path = os.path.join(config.DATA_DIR, "wb_session.json")
-            wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
             with open(wb_session_path, "w") as f:
                 json.dump(session_data, f, indent=2)
             ctx.storage_state(path=wb_state_path)
