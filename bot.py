@@ -392,11 +392,17 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                     timeout=70000,
                 )
             except Exception as e:
-                debug = _save_wb_login_debug(page, "wait_phone_input")
-                body = debug.get("body") or _safe_body_text(page, 700)
-                title = debug.get("title") or ""
+                try:
+                    current_url = page.url
+                except Exception:
+                    current_url = ""
+                try:
+                    title = page.title()
+                except Exception:
+                    title = ""
+                body = _safe_body_text(page, 1600)
                 if (
-                    "/lk" in (debug.get("url") or page.url)
+                    "/lk" in current_url
                     or "Профиль" in body
                     or "Заказы" in body
                 ):
@@ -405,9 +411,11 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                         "Сохраняю токены из текущего браузерного state..."
                     )
                     return _save_wb_session_from_context(ctx, page)
+
+                debug = _save_wb_login_debug(page, "wait_phone_input")
                 raise RuntimeError(
                     "WB не показал поле ввода телефона. "
-                    f"URL={debug.get('url') or page.url}; title={title!r}. "
+                    f"URL={debug.get('url') or current_url}; title={title!r}. "
                     f"Похоже на антибот/блокировку страницы. Debug: "
                     f"html={debug.get('html') or '-'}, screenshot={debug.get('screenshot') or '-'}. "
                     f"Текст страницы: {body[:500]}"
