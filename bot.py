@@ -88,6 +88,7 @@ dp.include_router(router)
 
 scheduler = AsyncIOScheduler()
 _background_tasks: set = set()
+_wb_session_task_lock: asyncio.Lock | None = None
 
 
 # --- FSM States ---
@@ -186,6 +187,43 @@ class WbSessionJob:
 
 
 _wb_session_jobs: dict[int, WbSessionJob] = {}
+_last_wb_session_alert_at = 0.0
+_WB_SESSION_ALERT_COOLDOWN = 6 * 60 * 60
+
+
+def _get_wb_session_task_lock() -> asyncio.Lock:
+    global _wb_session_task_lock
+    if _wb_session_task_lock is None:
+        _wb_session_task_lock = asyncio.Lock()
+    return _wb_session_task_lock
+
+
+def _get_owner_id() -> int | None:
+    owner = next((u for u in db.get_allowed_users() if u.get("is_owner")), None)
+    return int(owner["telegram_id"]) if owner else None
+
+
+async def _notify_owner_wb_session_problem(text: str, *, throttle: bool = True):
+    global _last_wb_session_alert_at
+    owner_id = _get_owner_id()
+    if not owner_id:
+        logger.warning("WB session problem, but owner is not configured: %s", text)
+        return
+
+    now = time.time()
+    if throttle and now - _last_wb_session_alert_at < _WB_SESSION_ALERT_COOLDOWN:
+        logger.warning("WB session alert throttled: %s", text)
+        return
+    _last_wb_session_alert_at = now
+
+    try:
+        await bot.send_message(
+            owner_id,
+            "⚠️ <b>WB-сессия требует внимания</b>\n\n" + escape(text),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("WB session owner notify failed: %s", e)
 
 
 def _normalize_ru_phone(raw: str) -> str | None:
@@ -236,6 +274,13 @@ def _safe_body_text(page, limit: int = 1000) -> str:
         return re.sub(r"\s+", " ", page.inner_text("body"))[:limit]
     except Exception:
         return ""
+
+
+def _atomic_json_dump(path: str, data: dict):
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
 
 
 def _save_wb_login_debug(page, reason: str) -> dict:
@@ -323,8 +368,7 @@ def _save_wb_session_from_context(ctx, page) -> dict:
     }
     wb_session_path = os.path.join(config.DATA_DIR, "wb_session.json")
     wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
-    with open(wb_session_path, "w") as f:
-        json.dump(session_data, f, indent=2)
+    _atomic_json_dump(wb_session_path, session_data)
     ctx.storage_state(path=wb_state_path)
 
     wbaas_cache_path = os.path.join(config.DATA_DIR, "wbaas_proxy_tokens.json")
@@ -337,8 +381,7 @@ def _save_wb_session_from_context(ctx, page) -> dict:
         "token": cookies["x_wbaas_token"],
         "updated_at": time.time(),
     }
-    with open(wbaas_cache_path, "w") as f:
-        json.dump(wbaas_cache, f, indent=2)
+    _atomic_json_dump(wbaas_cache_path, wbaas_cache)
 
     return {
         "sys_auth": sys_auth,
@@ -347,6 +390,57 @@ def _save_wb_session_from_context(ctx, page) -> dict:
         "wbaas": has_wbaas,
         "wbauid": cookies.get("_wbauid", ""),
     }
+
+
+def _run_wb_session_keepalive_sync() -> dict:
+    """Refresh WB cookies from an already-authorized Playwright state."""
+    from playwright.sync_api import sync_playwright
+
+    wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
+    if not os.path.exists(wb_state_path):
+        raise RuntimeError("Нет сохранённого Playwright state WB. Нужна ручная авторизация.")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            ctx = browser.new_context(
+                storage_state=wb_state_path,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/141.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+            )
+            ctx.add_init_script(
+                'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+            )
+            page = ctx.new_page()
+            page.goto("https://www.wildberries.ru/", timeout=30000)
+            page.wait_for_timeout(3000)
+            page.goto("https://www.wildberries.ru/lk", timeout=30000)
+            page.wait_for_timeout(5000)
+
+            body = _safe_body_text(page, 1600)
+            is_lk = "/lk" in page.url and ("Профиль" in body or "Заказы" in body)
+            if not is_lk:
+                debug = _save_wb_login_debug(page, "keepalive_not_logged_in")
+                raise RuntimeError(
+                    "WB keepalive не смог открыть авторизованный ЛК. "
+                    f"URL={page.url}; title={page.title()!r}. "
+                    f"Debug: html={debug.get('html') or '-'}, "
+                    f"screenshot={debug.get('screenshot') or '-'}. "
+                    "Нужна ручная авторизация WB."
+                )
+
+            return _save_wb_session_from_context(ctx, page)
+        finally:
+            browser.close()
 
 
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
@@ -565,14 +659,15 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
         _schedule_status(loop, job.chat_id, text)
 
     try:
-        result = await asyncio.to_thread(
-            _run_wb_session_login_sync,
-            job.phone,
-            job,
-            status,
-        )
-        status("🧪 Проверяю новую сессию на поисковом endpoint WB...")
-        status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
+        async with _get_wb_session_task_lock():
+            result = await asyncio.to_thread(
+                _run_wb_session_login_sync,
+                job.phone,
+                job,
+                status,
+            )
+            status("🧪 Проверяю новую сессию на поисковом endpoint WB...")
+            status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
         if status_code != 200:
             raise RuntimeError(f"WB всё ещё отвечает HTTP {status_code} после обновления.")
 
@@ -2592,9 +2687,73 @@ def _format_shelf_results(sku: str, competitors: list, results: dict,
 
 # --- Scheduler ---
 
+async def _refresh_wb_session_from_saved_state(reason: str) -> tuple[int, int] | None:
+    lock = _get_wb_session_task_lock()
+    if lock.locked():
+        logger.info("WB session keepalive skipped (%s): another session task is running", reason)
+        return None
+
+    async with lock:
+        logger.info("WB session keepalive started (%s)", reason)
+        result = await asyncio.to_thread(_run_wb_session_keepalive_sync)
+        logger.info(
+            "WB session keepalive saved tokens (%s): account=%s wbauid=%s",
+            reason,
+            result.get("sys_auth") or "unknown",
+            result.get("wbauid") or "",
+        )
+        status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
+        if status_code != 200:
+            raise RuntimeError(f"WB endpoint returned HTTP {status_code} after keepalive.")
+        logger.info(
+            "WB session keepalive verified (%s): HTTP 200, products=%d",
+            reason,
+            products_count,
+        )
+        return status_code, products_count
+
+
+async def scheduled_wb_session_keepalive():
+    try:
+        await _refresh_wb_session_from_saved_state("daily")
+    except Exception as e:
+        logger.exception("WB session keepalive failed")
+        await _notify_owner_wb_session_problem(
+            "Ежедневное обновление WB cookies не прошло. "
+            f"{e}\n\nНужна ручная авторизация WB.",
+            throttle=False,
+        )
+
+
+async def ensure_wb_session_for_parse() -> bool:
+    try:
+        status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
+        if status_code == 200:
+            logger.info("WB session pre-parse check OK: products=%d", products_count)
+            return True
+
+        logger.warning("WB session pre-parse check failed: HTTP %s", status_code)
+        refreshed = await _refresh_wb_session_from_saved_state(f"pre_parse_http_{status_code}")
+        if refreshed is None:
+            return False
+        return True
+    except Exception as e:
+        logger.exception("WB session pre-parse recovery failed")
+        await _notify_owner_wb_session_problem(
+            "WB endpoint не принимает текущую сессию, автоматическое восстановление не прошло. "
+            f"{e}\n\nНужна ручная авторизация WB.",
+            throttle=True,
+        )
+        return False
+
+
 async def scheduled_parse():
     """Auto-parse for all users with auto_check articles using Chrome positions."""
     logger.info("Scheduled auto-parse started")
+    if not await ensure_wb_session_for_parse():
+        logger.warning("Scheduled auto-parse skipped: WB session is not healthy")
+        return
+
     users = db.get_allowed_users()
 
     async def parse_user(uid):
@@ -2683,10 +2842,23 @@ def reschedule_parser():
     logger.info(f"Scheduler set to {interval} min interval")
 
 
+def schedule_wb_session_keepalive():
+    scheduler.add_job(
+        scheduled_wb_session_keepalive,
+        trigger=IntervalTrigger(hours=24),
+        id="wb_session_keepalive",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    logger.info("WB session keepalive scheduled every 24h")
+
+
 # --- Main ---
 
 async def main():
     reschedule_parser()
+    schedule_wb_session_keepalive()
     scheduler.start()
     await position_queue.start()
 
