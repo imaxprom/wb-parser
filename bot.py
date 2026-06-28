@@ -480,9 +480,14 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
             page.goto("https://www.wildberries.ru/security/login", timeout=30000)
 
             status_cb("🛡 Прохожу антибот-проверку WB...")
+            phone_selector = (
+                'input[name="phoneNumber"]:not([type="radio"]), '
+                'input[data-test-id="field_phone_input"], '
+                'input#wb-phone-number'
+            )
             try:
                 page.wait_for_selector(
-                    'input[name="phoneNumber"]:not([type="radio"])',
+                    phone_selector,
                     timeout=70000,
                 )
             except Exception as e:
@@ -518,10 +523,16 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
             if job.cancel_event.is_set():
                 raise RuntimeError("Обновление отменено.")
 
-            phone_input = page.locator(
-                'input[name="phoneNumber"]:not([type="radio"])'
-            ).first
-            phone_input.fill(phone)
+            phone_input = page.locator(phone_selector).first
+            phone_value = phone
+            try:
+                input_id = phone_input.get_attribute("id") or ""
+                data_test_id = phone_input.get_attribute("data-test-id") or ""
+                if input_id == "wb-phone-number" or data_test_id == "field_phone_input":
+                    phone_value = phone[1:] if len(phone) == 11 and phone.startswith("7") else phone
+            except Exception:
+                pass
+            phone_input.fill(phone_value)
             page.wait_for_timeout(800)
 
             rendered_phone = phone_input.input_value()
