@@ -351,16 +351,18 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
             return result
         d_np2, e4 = do_fetch(2, "no_promo")
     else:
-        # Direct: 4 fetches in parallel (T07 — fastest, 100% stable with auth)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            f_n1 = pool.submit(do_fetch, 1)
-            f_n2 = pool.submit(do_fetch, 2)
-            f_np1 = pool.submit(do_fetch, 1, "no_promo")
-            f_np2 = pool.submit(do_fetch, 2, "no_promo")
-        d_n1, e1 = f_n1.result()
-        d_n2, e2 = f_n2.result()
-        d_np1, e3 = f_np1.result()
-        d_np2, e4 = f_np2.result()
+        # Direct WB started returning 403 for the parallel 4-request burst.
+        # Keep one curl session and fetch sequentially; this matches browser-like reuse.
+        d_n1, e1 = do_fetch(1)
+        if e1:
+            result["error"] = True
+            return result
+        d_n2, e2 = do_fetch(2)
+        d_np1, e3 = do_fetch(1, "no_promo")
+        if e3:
+            result["error"] = True
+            return result
+        d_np2, e4 = do_fetch(2, "no_promo")
         if e1 or e3:
             result["error"] = True
             return result
