@@ -235,7 +235,7 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
 
     # PoW token
     pow_raw = ls.get("session-pow-token", "")
-    if pow_raw:
+    if pow_raw and token_key != "__direct__":
         try:
             pow_data = json.loads(pow_raw)
             pow_token = pow_data.get("token", "")
@@ -333,7 +333,6 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         if ab_testid:
             p["ab_testid"] = ab_testid
             request_headers = dict(headers)
-            request_headers.pop("X-Pow", None)
             request_headers.pop("X-Queryid", None)
         return _search_sync(request_headers, p, proxy_url, session)
 
