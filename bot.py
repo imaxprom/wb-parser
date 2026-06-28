@@ -392,6 +392,25 @@ def _save_wb_session_from_context(ctx, page) -> dict:
     }
 
 
+def _wb_context_has_auth_tokens(ctx, page) -> tuple[bool, dict]:
+    cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+    ls_data = page.evaluate("""() => {
+        var d = {};
+        for (var i = 0; i < localStorage.length; i++) {
+            var k = localStorage.key(i);
+            d[k] = localStorage.getItem(k);
+        }
+        return d;
+    }""")
+    checks = {
+        "bearer": bool(ls_data.get("wbx__tokenData")),
+        "pow": bool(ls_data.get("session-pow-token")),
+        "wbaas": bool(cookies.get("x_wbaas_token")),
+        "sys_auth": ls_data.get("_sys_auth", ""),
+    }
+    return bool(checks["bearer"] and checks["pow"] and checks["wbaas"]), checks
+
+
 def _run_wb_session_keepalive_sync() -> dict:
     """Refresh WB cookies from an already-authorized Playwright state."""
     from playwright.sync_api import sync_playwright
@@ -619,9 +638,26 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 raise RuntimeError("WB не принял код. Проверь код и запусти обновление заново.")
 
             status_cb("💾 Сохраняю новую WB-сессию...")
-            page.goto("https://www.wildberries.ru/", timeout=30000)
-            page.wait_for_timeout(10000)
-            return _save_wb_session_from_context(ctx, page)
+            try:
+                page.wait_for_url(lambda url: "wildberries.ru" in url and "id.wb.ru" not in url, timeout=20000)
+            except Exception:
+                pass
+
+            last_checks = {}
+            for target in ("https://www.wildberries.ru/lk", "https://www.wildberries.ru/"):
+                page.goto(target, timeout=30000, wait_until="domcontentloaded")
+                for _ in range(12):
+                    page.wait_for_timeout(2500)
+                    has_tokens, last_checks = _wb_context_has_auth_tokens(ctx, page)
+                    if has_tokens:
+                        return _save_wb_session_from_context(ctx, page)
+
+            debug = _save_wb_login_debug(page, "missing_tokens_after_code")
+            raise RuntimeError(
+                "WB ID принял код, но www.wildberries.ru не выдал полный набор токенов: "
+                f"{last_checks}. Debug: html={debug.get('html') or '-'}, "
+                f"screenshot={debug.get('screenshot') or '-'}."
+            )
         finally:
             browser.close()
 
