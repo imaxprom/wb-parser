@@ -649,7 +649,25 @@ def _verify_current_wb_session_sync() -> tuple[int, int]:
     )
     if resp.status_code != 200:
         return resp.status_code, 0
-    return resp.status_code, len(resp.json().get("products", []))
+    products_count = len(resp.json().get("products", []))
+    if products_count <= 0:
+        return 200, 0
+
+    session = curl_requests.Session(impersonate="chrome")
+    try:
+        parsed = proxy_positions._fetch_keyword_sync(
+            "",
+            params["query"],
+            0,
+            int(config.WB_DEST),
+            session,
+        )
+    finally:
+        session.close()
+    if parsed.get("error"):
+        return 599, products_count
+
+    return resp.status_code, products_count
 
 
 async def _run_wb_session_job(uid: int, job: WbSessionJob):
@@ -668,8 +686,11 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
             )
             status("🧪 Проверяю новую сессию на поисковом endpoint WB...")
             status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
-        if status_code != 200:
-            raise RuntimeError(f"WB всё ещё отвечает HTTP {status_code} после обновления.")
+        if status_code != 200 or products_count <= 0:
+            raise RuntimeError(
+                "WB всё ещё не отдаёт рабочую выдачу после обновления: "
+                f"HTTP {status_code}, товаров={products_count}."
+            )
 
         await bot.send_message(
             job.chat_id,
@@ -2703,8 +2724,11 @@ async def _refresh_wb_session_from_saved_state(reason: str) -> tuple[int, int] |
             result.get("wbauid") or "",
         )
         status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
-        if status_code != 200:
-            raise RuntimeError(f"WB endpoint returned HTTP {status_code} after keepalive.")
+        if status_code != 200 or products_count <= 0:
+            raise RuntimeError(
+                "WB endpoint did not return a usable response after keepalive: "
+                f"HTTP {status_code}, products={products_count}."
+            )
         logger.info(
             "WB session keepalive verified (%s): HTTP 200, products=%d",
             reason,
@@ -2728,11 +2752,15 @@ async def scheduled_wb_session_keepalive():
 async def ensure_wb_session_for_parse() -> bool:
     try:
         status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
-        if status_code == 200:
+        if status_code == 200 and products_count > 0:
             logger.info("WB session pre-parse check OK: products=%d", products_count)
             return True
 
-        logger.warning("WB session pre-parse check failed: HTTP %s", status_code)
+        logger.warning(
+            "WB session pre-parse check failed: HTTP %s, products=%s",
+            status_code,
+            products_count,
+        )
         refreshed = await _refresh_wb_session_from_saved_state(f"pre_parse_http_{status_code}")
         if refreshed is None:
             return False

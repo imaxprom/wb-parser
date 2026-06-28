@@ -325,13 +325,17 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         "limit": "300",
     }
 
-    result = {"query": query, "promo_pos": None, "organic_pos": None, "is_advertised": False, "error": False}
+    result = {"query": query, "promo_pos": None, "organic_pos": None, "is_advertised": False, "preset_id": None, "tokens": [], "error": False}
 
     def do_fetch(page, ab_testid=None):
         p = {**base_params, "page": str(page)}
+        request_headers = headers
         if ab_testid:
             p["ab_testid"] = ab_testid
-        return _search_sync(headers, p, proxy_url, session)
+            request_headers = dict(headers)
+            request_headers.pop("X-Pow", None)
+            request_headers.pop("X-Queryid", None)
+        return _search_sync(request_headers, p, proxy_url, session)
 
     import concurrent.futures
 
@@ -396,6 +400,9 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         if pid == sku:
             promo_pos = i + 1
             is_ad = bool(logs)
+            meta = product.get("meta") or {}
+            result["preset_id"] = meta.get("presetId")
+            result["tokens"] = meta.get("tokens") or []
 
     # Find organic position via no_promo -> orgMap
     organic_pos = None
@@ -403,11 +410,27 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         if product.get("id") == sku:
             nopromo_pos = j + 1
             organic_pos = org_map.get(nopromo_pos)
+            if result.get("preset_id") is None:
+                meta = product.get("meta") or {}
+                result["preset_id"] = meta.get("presetId")
+                result["tokens"] = meta.get("tokens") or []
             break
 
     result["promo_pos"] = promo_pos
     result["organic_pos"] = organic_pos
     result["is_advertised"] = is_ad
+
+    # Meta-2 fallback: if nmId is not in top pages, use the canonical preset
+    # from metadata.catalog_value. It is the search cluster id for the query.
+    if result.get("preset_id") is None:
+        for d in (d_n1, d_np1, d_n2, d_np2):
+            cv = (d or {}).get("metadata", {}).get("catalog_value", "") if isinstance(d, dict) else ""
+            if cv.startswith("preset="):
+                try:
+                    result["preset_id"] = int(cv.split("=", 1)[1].split("&", 1)[0])
+                    break
+                except (ValueError, IndexError):
+                    pass
 
     # Mark as error — triggers retry
     if incomplete and promo_pos is None and organic_pos is None:
@@ -478,6 +501,8 @@ async def get_positions(article: int, keywords: list[str],
             "promo_pos": item["promo_pos"],
             "organic_pos": item["organic_pos"],
             "is_advertised": item["is_advertised"],
+            "preset_id": item.get("preset_id"),
+            "tokens": item.get("tokens") or [],
             "error": item.get("error", False),
         }
         logger.info(
@@ -493,6 +518,6 @@ async def get_positions(article: int, keywords: list[str],
     # Fill missing keywords
     for kw in keywords:
         if kw not in result:
-            result[kw] = {"promo_pos": None, "organic_pos": None, "is_advertised": False, "error": True}
+            result[kw] = {"promo_pos": None, "organic_pos": None, "is_advertised": False, "preset_id": None, "tokens": [], "error": True}
 
     return result
