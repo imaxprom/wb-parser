@@ -614,14 +614,8 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
 
             code_inputs = page.query_selector_all('input[data-test-id="field_code_input"]')
             if code_inputs:
-                first_max_length = (code_inputs[0].get_attribute("maxlength") or "").strip()
-                if first_max_length and int(first_max_length) >= len(code):
-                    code_inputs[0].fill(code)
-                else:
-                    for i, ch in enumerate(code):
-                        if i < len(code_inputs):
-                            code_inputs[i].fill(ch)
-                            page.wait_for_timeout(100)
+                code_inputs[0].click()
+                page.keyboard.type(code, delay=120)
             else:
                 code_inputs = page.query_selector_all('input[inputmode="numeric"]')
             if not code_inputs:
