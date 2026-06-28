@@ -612,13 +612,26 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
             code = job.code
             status_cb("🔐 Ввожу код WB...")
 
-            code_inputs = page.query_selector_all('input[inputmode="numeric"]')
+            code_inputs = page.query_selector_all('input[data-test-id="field_code_input"]')
+            if code_inputs:
+                first_max_length = (code_inputs[0].get_attribute("maxlength") or "").strip()
+                if first_max_length and int(first_max_length) >= len(code):
+                    code_inputs[0].fill(code)
+                else:
+                    for i, ch in enumerate(code):
+                        if i < len(code_inputs):
+                            code_inputs[i].fill(ch)
+                            page.wait_for_timeout(100)
+            else:
+                code_inputs = page.query_selector_all('input[inputmode="numeric"]')
             if not code_inputs:
                 code_inputs = page.query_selector_all('input[type="tel"]')
             if not code_inputs:
                 code_inputs = page.query_selector_all('input[type="number"]')
 
-            if len(code_inputs) >= 4:
+            if code_inputs and code_inputs[0].get_attribute("data-test-id") == "field_code_input":
+                pass
+            elif len(code_inputs) >= 4:
                 for i, ch in enumerate(code):
                     if i < len(code_inputs):
                         code_inputs[i].fill(ch)
