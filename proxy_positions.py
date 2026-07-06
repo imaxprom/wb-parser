@@ -207,6 +207,7 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Referer": "https://www.wildberries.ru/",
         "x-requested-with": "XMLHttpRequest",
+        "x-spa-version": "14.2.3",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "sec-fetch-dest": "empty",
@@ -214,6 +215,10 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
 
     ls = _wb_session.get("localStorage", {})
     cookies = _wb_session.get("cookies", {})
+
+    device_id = ls.get("wbx__sessionID")
+    if device_id:
+        headers["deviceid"] = device_id
 
     # Bearer token (skip for geo scan — would lock results to home region)
     if with_bearer:
@@ -229,7 +234,7 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
                     raw = bearer.split(".")[1]
                     raw += "=" * (4 - len(raw) % 4)
                     jwt_data = json.loads(base64.urlsafe_b64decode(raw))
-                    headers["x-userid"] = str(jwt_data.get("user", "0"))
+                    headers["X-Userid"] = str(jwt_data.get("user", "0"))
             except Exception as e:
                 logger.warning("Failed to parse Bearer: %s", e)
 
