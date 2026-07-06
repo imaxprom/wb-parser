@@ -189,6 +189,8 @@ class WbSessionJob:
 _wb_session_jobs: dict[int, WbSessionJob] = {}
 _last_wb_session_alert_at = 0.0
 _WB_SESSION_ALERT_COOLDOWN = 6 * 60 * 60
+_last_wb_session_recovery_failed_at = 0.0
+_WB_SESSION_RECOVERY_COOLDOWN = 2 * 60 * 60
 
 
 def _get_wb_session_task_lock() -> asyncio.Lock:
@@ -2804,10 +2806,12 @@ async def scheduled_wb_session_keepalive():
 
 
 async def ensure_wb_session_for_parse() -> bool:
+    global _last_wb_session_recovery_failed_at
     try:
         status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
         if status_code == 200 and products_count > 0:
             logger.info("WB session pre-parse check OK: products=%d", products_count)
+            _last_wb_session_recovery_failed_at = 0.0
             return True
 
         logger.warning(
@@ -2815,11 +2819,22 @@ async def ensure_wb_session_for_parse() -> bool:
             status_code,
             products_count,
         )
+        now = time.time()
+        if now - _last_wb_session_recovery_failed_at < _WB_SESSION_RECOVERY_COOLDOWN:
+            remaining = int(_WB_SESSION_RECOVERY_COOLDOWN - (now - _last_wb_session_recovery_failed_at))
+            logger.warning(
+                "WB session recovery skipped: cooldown active for %d more seconds",
+                remaining,
+            )
+            return False
+
         refreshed = await _refresh_wb_session_from_saved_state(f"pre_parse_http_{status_code}")
         if refreshed is None:
             return False
+        _last_wb_session_recovery_failed_at = 0.0
         return True
     except Exception as e:
+        _last_wb_session_recovery_failed_at = time.time()
         logger.exception("WB session pre-parse recovery failed")
         await _notify_owner_wb_session_problem(
             "WB endpoint не принимает текущую сессию, автоматическое восстановление не прошло. "
