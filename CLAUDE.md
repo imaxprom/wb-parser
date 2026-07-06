@@ -42,18 +42,21 @@ ssh wb-parser "~/wb-parser/deploy.sh"
 
 ## Подключение к VPS
 - `ssh wb-parser` — подключение (через ProxyJump proxmox-jump)
-- sudo пароль: `makson2026`
 - Сервисы: `wb-parser.service`, `ssh-tunnel-telegram.service`
 - Логи бота: `sudo journalctl -u wb-parser --no-pager -n 50`
 - Перезапуск: `sudo systemctl restart wb-parser`
 
 ## Парсинг WB — ключевые решения
 - **proxy_positions.py** — основной парсер (curl_cffi + авторизация покупателя)
-- **Режим T07**: 4 параллельных fetch + Session, ~2.5 сек на 6 ключевиков, 100% стабильность
-- **Авторизация**: Bearer + PoW + cookies из `data/wb_session.json` (получены через `wb_login.py`)
+- **Текущий прод-режим**: direct WB requests через `curl_cffi`; на проде `WB_PROXY_*` не настроены
+- **Текущая стратегия запросов**: последовательные fetch через `curl_cffi.Session`; параллельная пачка direct-запросов ранее приводила к 403/anti-bot
+- **Авторизация**: Bearer + cookies из `data/wb_session.json`, `x_wbaas_token` из cache/session; `X-Pow` в direct mode не отправляется
+- **Обязательный browser-header с 2026-07-06**: `deviceid` из `localStorage["wbx__sessionID"]`. Без него prod direct search возвращал `403 Angie`; с ним `__internal/search` вернул `200` и 300 товаров
+- **Дополнительные WB browser-headers**: `x-spa-version: 14.2.3`, `X-Userid`, `X-Queryid`, cookies `x_wbaas_token` и `_wbauid`
 - **Без авторизации данные нестабильны** — рекламные позиции мигают
 - **Retry**: если WB вернул пустые данные (error=True), автоматический повтор через 0.5 сек
 - **chrome_positions.py** — старый подход (AppleScript, Mac only), сохранён как запасной
+- **scripts/wb_manual_auth_local.py** — ручное локальное обновление WB-сессии через видимый Chromium; поддерживает proxy-аргументы, но браузерный путь не является основным парсером
 
 ## Telegram на VPS
 - Telegram API заблокирован на VPS напрямую
@@ -73,3 +76,12 @@ WB_PARSER_BOT_TOKEN=...
 PARSE_MODE=proxy
 TELEGRAM_PROXY=socks5://127.0.0.1:1080
 ```
+
+## Текущее состояние на 2026-07-06
+- Последний проверенный кодовый коммит: `7467d3d Add WB device id header`
+- Контекстные markdown-файлы могут быть сохранены отдельным более новым коммитом без рестарта сервиса
+- `npm run save-session-state` в этом репозитории не работает: нет `package.json`
+- Локальная БД: `alerts=3`, `allowed_users=4`, `articles=4`, `queries=24`, `results=1783`, `settings=3`, `wb_tokens=2`
+- Продовая БД: `alerts=3`, `allowed_users=4`, `articles=4`, `queries=24`, `results=1783`, `settings=3`, `wb_tokens=1`
+- Prod verification после фикса: `bot._verify_current_wb_session_sync()` вернул `(200, 300)`
+- `KnowledgeBase.tsx` в этом проекте отсутствует; UI/React части нет
