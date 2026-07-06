@@ -9,8 +9,11 @@ and data/wbaas_proxy_tokens.json.
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from curl_cffi import requests as curl_requests
 from playwright.sync_api import sync_playwright
@@ -98,6 +101,13 @@ def main():
         default=str(Path(config.DATA_DIR) / "wb_manual_auth_profile"),
         help="Persistent local browser profile directory.",
     )
+    parser.add_argument(
+        "--proxy-server",
+        default="",
+        help="Optional Playwright proxy server, for example http://host:port or socks5://host:port.",
+    )
+    parser.add_argument("--proxy-username", default="")
+    parser.add_argument("--proxy-password", default="")
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
 
@@ -112,15 +122,24 @@ def main():
 
     deadline = time.time() + args.timeout_minutes * 60
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=args.headless,
-            args=["--disable-blink-features=AutomationControlled"],
-            user_agent=UA,
-            viewport={"width": 1440, "height": 1000},
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-        )
+        context_kwargs = {
+            "headless": args.headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+            "user_agent": UA,
+            "viewport": {"width": 1440, "height": 1000},
+            "locale": "ru-RU",
+            "timezone_id": "Europe/Moscow",
+        }
+        if args.proxy_server:
+            proxy = {"server": args.proxy_server}
+            if args.proxy_username:
+                proxy["username"] = args.proxy_username
+            if args.proxy_password:
+                proxy["password"] = args.proxy_password
+            context_kwargs["proxy"] = proxy
+            print(f"Using proxy: {args.proxy_server}")
+
+        ctx = p.chromium.launch_persistent_context(str(profile_dir), **context_kwargs)
         ctx.add_init_script(
             'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
         )
