@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import socket
 import sqlite3
 import time
 import uuid
@@ -34,6 +35,20 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("cart-stock-worker")
+
+
+def systemd_notify(message: str):
+    """Notify systemd when this process is ready and still making progress."""
+    notify_socket = os.getenv("NOTIFY_SOCKET")
+    if not notify_socket:
+        return
+    address = f"\0{notify_socket[1:]}" if notify_socket.startswith("@") else notify_socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+            client.connect(address)
+            client.sendall(message.encode("utf-8"))
+    except OSError as error:
+        logger.warning("Could not notify systemd: %s", error)
 
 
 class SiteRequestError(RuntimeError):
@@ -358,12 +373,15 @@ class CartStockWorker:
 
     def run(self, once: bool = False):
         logger.info("Starting single cart-stock worker %s", self.worker_id)
+        systemd_notify("READY=1\nSTATUS=Polling MpHub cart-stock jobs")
         while True:
+            systemd_notify("WATCHDOG=1\nSTATUS=Processing MpHub cart-stock queue")
             try:
                 self.process_once()
             except Exception as error:
                 self.last_error = str(error)[:2000]
                 logger.exception("Cart-stock worker loop failed")
+            systemd_notify("WATCHDOG=1\nSTATUS=Waiting for the next MpHub cart-stock job")
             if once:
                 return
             time.sleep(config.CART_STOCK_WORKER_POLL_SECONDS)

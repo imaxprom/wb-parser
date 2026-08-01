@@ -4,7 +4,7 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=makson
 WorkingDirectory=/home/makson/wb-parser
 EnvironmentFile=-/home/makson/wb-parser/.env
@@ -12,6 +12,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/makson/wb-parser/venv/bin/python cart_stock_worker.py
 Restart=always
 RestartSec=5
+WatchdogSec=180
+NotifyAccess=main
 UMask=0077
 NoNewPrivileges=true
 
