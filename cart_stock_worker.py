@@ -265,14 +265,29 @@ class CartStockWorker:
                 "clientTotalQuantity": 0,
                 "missing": True,
                 "stocks": [],
+                "sizes": [],
             }
         warehouse_quantities: dict[int, int] = {}
+        normalized_sizes: list[dict] = []
         for size in product.get("sizes", []) or []:
+            size_warehouse_quantities: dict[int, int] = {}
             for stock in size.get("stocks", []) or []:
                 warehouse_id = int(stock.get("wh", 0) or 0)
                 quantity = int(stock.get("qty", 0) or 0)
                 if warehouse_id > 0 and quantity > 0:
                     warehouse_quantities[warehouse_id] = warehouse_quantities.get(warehouse_id, 0) + quantity
+                    size_warehouse_quantities[warehouse_id] = (
+                        size_warehouse_quantities.get(warehouse_id, 0) + quantity
+                    )
+            normalized_sizes.append({
+                "optionId": str(size.get("optionId") or ""),
+                "name": str(size.get("name") or ""),
+                "originalName": str(size.get("origName") or size.get("name") or ""),
+                "stocks": [
+                    {"warehouseId": warehouse_id, "quantity": quantity}
+                    for warehouse_id, quantity in size_warehouse_quantities.items()
+                ],
+            })
         return {
             "articleWB": article,
             "wbName": str(product.get("name") or ""),
@@ -282,6 +297,7 @@ class CartStockWorker:
                 {"warehouseId": warehouse_id, "quantity": quantity}
                 for warehouse_id, quantity in warehouse_quantities.items()
             ],
+            "sizes": normalized_sizes,
         }
 
     def collect(self, job: dict) -> dict:
