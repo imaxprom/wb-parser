@@ -1,0 +1,19 @@
+[Unit]
+Description=MpHub Authorized WB Cart Stock Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=makson
+WorkingDirectory=/home/makson/wb-parser
+EnvironmentFile=-/home/makson/wb-parser/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/makson/wb-parser/venv/bin/python cart_stock_worker.py
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

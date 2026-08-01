@@ -415,6 +415,10 @@ def _wb_context_has_auth_tokens(ctx, page) -> tuple[bool, dict]:
 
 def _run_wb_session_keepalive_sync() -> dict:
     """Refresh WB cookies from an already-authorized Playwright state."""
+    from wb_session_runtime import refresh_saved_session
+    return refresh_saved_session()
+
+    # Legacy implementation retained below for the SMS-login flow helpers.
     from playwright.sync_api import sync_playwright
 
     wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")

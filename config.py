@@ -19,6 +19,16 @@ TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY", "")  # http://user:pass@host:port
 # Parse mode: "proxy" or "chrome"
 PARSE_MODE = os.getenv("PARSE_MODE", "proxy")
 
+# MpHub authorized cart-stock worker
+MPHUB_CART_STOCK_URL = os.getenv("MPHUB_CART_STOCK_URL", "").rstrip("/")
+MPHUB_CART_STOCK_WORKER_SECRET = os.getenv("MPHUB_CART_STOCK_WORKER_SECRET", "")
+CART_STOCK_WORKER_ID = os.getenv("CART_STOCK_WORKER_ID", "wb-parser-primary")
+CART_STOCK_WORKER_POLL_SECONDS = max(
+    3,
+    int(os.getenv("CART_STOCK_WORKER_POLL_SECONDS", "10")),
+)
+CART_STOCK_DEST = os.getenv("CART_STOCK_DEST", "-364001")
+
 # Proxies (user:pass@host:port)
 WB_PROXIES = []
 for _k in ("WB_PROXY_1", "WB_PROXY_2", "WB_PROXY_3", "WB_PROXY_4"):
