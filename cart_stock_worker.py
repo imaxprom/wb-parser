@@ -29,6 +29,7 @@ BATCH_SIZE = 20
 HEARTBEAT_SECONDS = 60
 SITE_TIMEOUT_SECONDS = 30
 WB_TIMEOUT_SECONDS = 30
+MAX_OUTBOX_DELIVERY_ATTEMPTS = 18
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,7 +88,7 @@ class Outbox:
 
     def rows(self):
         return self.connection.execute(
-            "SELECT job_id, payload_json FROM cart_stock_outbox ORDER BY created_at, job_id"
+            "SELECT job_id, payload_json, attempts FROM cart_stock_outbox ORDER BY created_at, job_id"
         ).fetchall()
 
     def delete(self, job_id: int):
@@ -334,7 +335,15 @@ class CartStockWorker:
 
     def flush_outbox(self) -> bool:
         all_sent = True
-        for job_id, payload_json in self.outbox.rows():
+        for job_id, payload_json, attempts in self.outbox.rows():
+            if attempts >= MAX_OUTBOX_DELIVERY_ATTEMPTS:
+                logger.error(
+                    "Dropping outbox job %s after %s failed deliveries; its server lease will requeue it",
+                    job_id,
+                    attempts,
+                )
+                self.outbox.delete(job_id)
+                continue
             try:
                 payload = json.loads(payload_json)
                 self.site_request("/api/internal/cart-stock/worker/result", payload)
