@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 import config
+from wb_health import get_access_health, probe_delay_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -165,9 +166,33 @@ class PositionQueue:
                 task.uid, task.label, len(task.keywords), self.pending_count
             )
             try:
-                result = await _positions_module.get_positions(
-                    task.nm_id, task.keywords
-                )
+                access = get_access_health()
+                retry_delay = probe_delay_seconds(access)
+                if retry_delay > 0:
+                    logger.warning(
+                        "Task %s skipped: WB access state=%s, retry in %d seconds",
+                        task.label,
+                        access.get("state"),
+                        retry_delay,
+                    )
+                    result = {
+                        keyword: {
+                            "promo_pos": None,
+                            "organic_pos": None,
+                            "is_advertised": False,
+                            "preset_id": None,
+                            "tokens": [],
+                            "error": True,
+                            "error_state": access.get("state"),
+                            "status_code": access.get("last_status"),
+                            "error_message": access.get("last_error") or "WB access cooldown",
+                        }
+                        for keyword in task.keywords
+                    }
+                else:
+                    result = await _positions_module.get_positions(
+                        task.nm_id, task.keywords
+                    )
                 if not task.future.cancelled():
                     task.future.set_result(result)
                 logger.info("Done: %s (%.1fs since submit)",

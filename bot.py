@@ -208,6 +208,7 @@ class WbSessionJob:
 _wb_session_jobs: dict[int, WbSessionJob] = {}
 _last_wb_alert_at: dict[str, float] = {}
 _WB_SESSION_ALERT_COOLDOWN = 6 * 60 * 60
+_WB_MANUAL_HEALTH_FRESH_SECONDS = 5 * 60
 
 
 def _get_wb_session_task_lock() -> asyncio.Lock:
@@ -249,6 +250,53 @@ async def _notify_owner_wb_session_problem(
         )
     except Exception as e:
         logger.warning("WB session owner notify failed: %s", e)
+
+
+def _wb_access_problem_text(health: dict) -> str:
+    state = str(health.get("state") or "unknown")
+    status_code = health.get("last_status")
+    retry_delay = probe_delay_seconds(health)
+    retry_minutes = max(1, (retry_delay + 59) // 60) if retry_delay else 0
+    retry_text = f" Следующая проверка примерно через {retry_minutes} мин." if retry_minutes else ""
+
+    if state == "antibot":
+        return (
+            "🛡 <b>WB включил антибот-защиту</b>\n\n"
+            f"Авторизация сохранена, но запросы временно заблокированы (HTTP {status_code})."
+            f"{retry_text}"
+        )
+    if state == "rate_limited":
+        return (
+            "⏳ <b>WB ограничил частоту запросов</b>\n\n"
+            f"Авторизация активна.{retry_text}"
+        )
+    if state == "auth_expired":
+        return (
+            "🔐 <b>WB-сессия действительно истекла</b>\n\n"
+            "Нужно обновить авторизацию в настройках бота."
+        )
+    return (
+        "⚠️ <b>WB временно недоступен</b>\n\n"
+        f"Последняя ошибка: HTTP {status_code or '—'}.{retry_text}"
+    )
+
+
+async def _ensure_wb_access_for_manual_parse() -> tuple[bool, str]:
+    health = get_access_health()
+    if probe_delay_seconds(health) > 0:
+        return False, _wb_access_problem_text(health)
+
+    last_checked_at = float(health.get("last_checked_at") or 0)
+    health_is_fresh = (
+        health.get("state") == "healthy"
+        and time.time() - last_checked_at <= _WB_MANUAL_HEALTH_FRESH_SECONDS
+    )
+    if health_is_fresh:
+        return True, ""
+
+    if await ensure_wb_session_for_parse():
+        return True, ""
+    return False, _wb_access_problem_text(get_access_health())
 
 
 def _normalize_ru_phone(raw: str) -> str | None:
@@ -740,7 +788,7 @@ def _verify_current_wb_session_sync() -> tuple[int, int]:
     finally:
         session.close()
     if parsed.get("error"):
-        return 599, products_count
+        return parsed.get("status_code") or 599, products_count
 
     return resp.status_code, products_count
 
@@ -1525,6 +1573,11 @@ async def run_evirma_handler(callback: CallbackQuery):
     msg_id = callback.message.message_id
 
     try:
+        access_ok, access_message = await _ensure_wb_access_for_manual_parse()
+        if not access_ok:
+            await callback.message.edit_text(access_message, parse_mode="HTML")
+            return
+
         if target == "all":
             await callback.message.edit_text("⏳ Проверяю все артикулы (Орг/Рекл)...")
             task = asyncio.create_task(_do_evirma_all(uid, chat_id, msg_id))
@@ -1557,6 +1610,29 @@ async def run_evirma_handler(callback: CallbackQuery):
             pass
 
 
+def _save_evirma_positions(uid: int, article: dict, queries: list, positions: dict):
+    """Save valid positions only; transport/access errors must not become missing ranks."""
+    for query in queries:
+        pos_data = positions.get(query["query"], {})
+        if pos_data.get("error"):
+            logger.warning(
+                "Skipping failed position result in history: sku=%s query=%r state=%s status=%s",
+                article.get("sku"),
+                query["query"],
+                pos_data.get("error_state"),
+                pos_data.get("status_code"),
+            )
+            continue
+        promo_pos = pos_data.get("promo_pos")
+        db.save_result(
+            uid,
+            article["id"],
+            query["id"],
+            promo_pos,
+            1 if promo_pos and promo_pos <= 300 else 2,
+        )
+
+
 async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, queries: list):
     """Background task: get evirma positions for one article via queue."""
     try:
@@ -1584,11 +1660,7 @@ async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, que
         positions = await future
         elapsed = time.time() - start
 
-        # Save positions for charts
-        for q in queries:
-            pos_data = positions.get(q["query"], {})
-            promo_pos = pos_data.get("promo_pos")
-            db.save_result(uid, article["id"], q["id"], promo_pos, 1 if promo_pos and promo_pos <= 300 else 2)
+        _save_evirma_positions(uid, article, queries, positions)
 
         text = _format_evirma_results(sku, keywords, positions, elapsed, name=art_name)
         await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
@@ -1632,6 +1704,7 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
 
         # Collect results as they complete
         all_blocks = []
+        all_position_sets = []
         for i, (article, queries, keywords, future) in enumerate(task_infos):
             sku = article["sku"]
             art_name = article.get("name") or ""
@@ -1647,15 +1720,12 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
                     pass
 
             positions = await future
+            all_position_sets.append(positions)
 
             lines = _format_evirma_block(sku, keywords, positions, name=art_name)
             all_blocks.append(lines)
 
-            # Save positions for charts
-            for q in queries:
-                pos_data = positions.get(q["query"], {})
-                promo_pos = pos_data.get("promo_pos")
-                db.save_result(uid, article["id"], q["id"], promo_pos, 1 if promo_pos and promo_pos <= 300 else 2)
+            _save_evirma_positions(uid, article, queries, positions)
 
         elapsed = time.time() - start
         now = datetime.now().strftime("%H:%M %d.%m")
@@ -1672,6 +1742,7 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
                 all_lines.extend(separator); all_lines.append("")
 
         text = f"{now} | {elapsed:.1f}с\n\n<pre>{chr(10).join(all_lines)}</pre>"
+        text += _evirma_error_notice(all_position_sets)
 
         if len(text) > 4000:
             # Split into chunks
@@ -1681,6 +1752,9 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
                     await bot.edit_message_text(block_text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
                 else:
                     await bot.send_message(chat_id, block_text, parse_mode="HTML")
+            error_notice = _evirma_error_notice(all_position_sets)
+            if error_notice:
+                await bot.send_message(chat_id, error_notice.lstrip(), parse_mode="HTML")
         else:
             await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     except Exception as e:
@@ -1706,7 +1780,15 @@ def _format_evirma_block(sku: str, keywords: list[str], positions: dict, name: s
         q_display = kw if len(kw) <= 26 else kw[:25] + "…"
         padding = max(1, 28 - len(q_display))
 
-        if is_ad:
+        if is_error:
+            promo_str = "ERR"
+            organic_str = {
+                "antibot": "A-B",
+                "rate_limited": "429",
+                "auth_expired": "AUTH",
+                "network_error": "NET",
+            }.get(pos_data.get("error_state"), "ERR")
+        elif is_ad:
             promo_str = str(promo) if promo is not None else "—"
             if organic is not None and promo is not None:
                 organic_str = "+" + str(organic - promo)
@@ -1724,12 +1806,37 @@ def _format_evirma_block(sku: str, keywords: list[str], positions: dict, name: s
     return lines
 
 
+def _evirma_error_notice(position_sets: list[dict]) -> str:
+    errors = [
+        item
+        for positions in position_sets
+        for item in positions.values()
+        if item.get("error")
+    ]
+    if not errors:
+        return ""
+
+    states = {item.get("error_state") for item in errors}
+    statuses = sorted({item.get("status_code") for item in errors if item.get("status_code")})
+    status_text = ", ".join(map(str, statuses)) or "—"
+    if "antibot" in states:
+        reason = "WB включил антибот-защиту; авторизация не слетела"
+    elif "rate_limited" in states:
+        reason = "WB ограничил частоту запросов"
+    elif "auth_expired" in states:
+        reason = "WB-сессия истекла"
+    else:
+        reason = "WB не вернул полные данные"
+    return f"\n⚠️ {len(errors)} запросов не выполнены: {reason} (HTTP {status_text})."
+
+
 def _format_evirma_results(sku: str, keywords: list[str], positions: dict, elapsed: float = None, name: str = "") -> str:
     """Format evirma results for single SKU."""
     now = datetime.now().strftime("%H:%M %d.%m")
     lines = _format_evirma_block(sku, keywords, positions, name)
     text = f"<b>SKU {sku}</b> | {now}{_elapsed_str(elapsed)}\n\n"
     text += f"<pre>{chr(10).join(lines)}</pre>"
+    text += _evirma_error_notice([positions])
     return text
 
 
@@ -3053,6 +3160,7 @@ async def scheduled_parse():
                 return
 
             all_blocks = []
+            all_position_sets = []
             start = time.time()
 
             # Submit all to queue
@@ -3073,14 +3181,11 @@ async def scheduled_parse():
                 sku = article["sku"]
                 art_name = article.get("name") or ""
                 positions = await future
+                all_position_sets.append(positions)
                 lines = _format_evirma_block(sku, keywords, positions, name=art_name)
                 all_blocks.append(lines)
 
-                # Save positions for charts
-                for q in queries_list:
-                    pos_data = positions.get(q["query"], {})
-                    promo_pos = pos_data.get("promo_pos")
-                    db.save_result(uid, article["id"], q["id"], promo_pos, 1 if promo_pos and promo_pos <= 300 else 2)
+                _save_evirma_positions(uid, article, queries_list, positions)
 
             elapsed = time.time() - start
 
@@ -3096,11 +3201,15 @@ async def scheduled_parse():
                     all_lines.extend(separator); all_lines.append("")
 
             text = f"{now} | {elapsed:.1f}с\n\n<pre>{chr(10).join(all_lines)}</pre>"
+            text += _evirma_error_notice(all_position_sets)
 
             if len(text) > 4000:
                 for i, block in enumerate(all_blocks):
                     block_text = f"<pre>{chr(10).join(block)}</pre>"
                     await bot.send_message(uid, block_text, parse_mode="HTML")
+                error_notice = _evirma_error_notice(all_position_sets)
+                if error_notice:
+                    await bot.send_message(uid, error_notice.lstrip(), parse_mode="HTML")
             else:
                 await bot.send_message(uid, text, parse_mode="HTML")
 

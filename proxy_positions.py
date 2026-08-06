@@ -19,7 +19,17 @@ from typing import Optional
 from curl_cffi import requests as curl_requests
 
 import config
-from wb_health import WB_BROWSER_USER_AGENT, WB_CURL_IMPERSONATE
+from wb_health import (
+    ANTIBOT_HTTP_STATUSES,
+    AUTH_HTTP_STATUSES,
+    RATE_LIMIT_HTTP_STATUSES,
+    WB_BROWSER_USER_AGENT,
+    WB_CURL_IMPERSONATE,
+    record_antibot,
+    record_auth_expired,
+    record_network_error,
+    record_rate_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,8 +273,8 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
 
 
 def _search_sync(headers: dict, params: dict, proxy_url: str = None,
-                 session: curl_requests.Session = None) -> tuple[dict, bool]:
-    """Single search request via curl_cffi. Returns (data, is_error)."""
+                 session: curl_requests.Session = None) -> tuple[dict, dict | None]:
+    """Single search request. Returns (data, classified_error)."""
     try:
         kwargs = {
             "params": params,
@@ -278,19 +288,41 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         client = session if session else curl_requests
         resp = client.get(SEARCH_URL, **kwargs)
         if resp.status_code == 200:
-            return resp.json(), False
-        elif resp.status_code == 429:
+            return resp.json(), None
+        if resp.status_code in RATE_LIMIT_HTTP_STATUSES:
             logger.warning("429 rate limit")
-            return {}, True
-        elif resp.status_code in (451, 498):
+            return {}, {
+                "error_state": "rate_limited",
+                "status_code": resp.status_code,
+                "error_message": f"WB rate limit: HTTP {resp.status_code}",
+            }
+        if resp.status_code in ANTIBOT_HTTP_STATUSES:
             logger.warning("%d anti-bot block", resp.status_code)
-            return {}, True
-        else:
-            logger.warning("HTTP %d from WB", resp.status_code)
-            return {}, True
+            return {}, {
+                "error_state": "antibot",
+                "status_code": resp.status_code,
+                "error_message": f"WB anti-bot protection: HTTP {resp.status_code}",
+            }
+        if resp.status_code in AUTH_HTTP_STATUSES:
+            logger.warning("%d expired WB session", resp.status_code)
+            return {}, {
+                "error_state": "auth_expired",
+                "status_code": resp.status_code,
+                "error_message": f"WB session expired: HTTP {resp.status_code}",
+            }
+        logger.warning("HTTP %d from WB", resp.status_code)
+        return {}, {
+            "error_state": "network_error",
+            "status_code": resp.status_code,
+            "error_message": f"WB search returned HTTP {resp.status_code}",
+        }
     except Exception as e:
         logger.error("Request error: %s", e)
-        return {}, True
+        return {}, {
+            "error_state": "network_error",
+            "status_code": None,
+            "error_message": f"WB request error: {e}",
+        }
 
 
 def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
@@ -321,7 +353,24 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         "limit": "300",
     }
 
-    result = {"query": query, "promo_pos": None, "organic_pos": None, "is_advertised": False, "preset_id": None, "tokens": [], "error": False}
+    result = {
+        "query": query,
+        "promo_pos": None,
+        "organic_pos": None,
+        "is_advertised": False,
+        "preset_id": None,
+        "tokens": [],
+        "error": False,
+        "error_state": None,
+        "status_code": None,
+        "error_message": "",
+    }
+
+    def fail(error_info: dict | None = None):
+        result["error"] = True
+        if error_info:
+            result.update(error_info)
+        return result
 
     def do_fetch(page, ab_testid=None):
         p = {**base_params, "page": str(page)}
@@ -332,41 +381,40 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
             request_headers.pop("X-Queryid", None)
         return _search_sync(request_headers, p, proxy_url, session)
 
-    import concurrent.futures
-
     if proxy_url:
         # Proxy: sequential to avoid timeouts
         d_n1, e1 = do_fetch(1)
         if e1:
-            result["error"] = True
-            return result
+            return fail(e1)
         d_n2, e2 = do_fetch(2)
+        if e2:
+            return fail(e2)
         d_np1, e3 = do_fetch(1, "no_promo")
         if e3:
-            result["error"] = True
-            return result
+            return fail(e3)
         d_np2, e4 = do_fetch(2, "no_promo")
+        if e4:
+            return fail(e4)
     else:
         # Direct WB started returning 403 for the parallel 4-request burst.
         # Keep one curl session and fetch sequentially; this matches browser-like reuse.
         d_n1, e1 = do_fetch(1)
         if e1:
-            result["error"] = True
-            return result
+            return fail(e1)
         d_n2, e2 = do_fetch(2)
+        if e2:
+            return fail(e2)
         d_np1, e3 = do_fetch(1, "no_promo")
         if e3:
-            result["error"] = True
-            return result
+            return fail(e3)
         d_np2, e4 = do_fetch(2, "no_promo")
-        if e1 or e3:
-            result["error"] = True
-            return result
+        if e4:
+            return fail(e4)
 
     n1_products = d_n1.get("products", [])
-    n2_products = d_n2.get("products", []) if not e2 else []
+    n2_products = d_n2.get("products", [])
     np1_products = d_np1.get("products", [])
-    np2_products = d_np2.get("products", []) if not e4 else []
+    np2_products = d_np2.get("products", [])
 
     # Detect incomplete/empty response = WB glitch
     incomplete = False
@@ -374,9 +422,9 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         incomplete = True  # normal page 1 empty
     if len(np1_products) == 0:
         incomplete = True  # nopromo page 1 empty
-    if len(n1_products) >= 300 and len(n2_products) == 0 and not e2:
+    if len(n1_products) >= 300 and len(n2_products) == 0:
         incomplete = True  # normal page 2 empty when page 1 full
-    if len(np1_products) >= 300 and len(np2_products) == 0 and not e4:
+    if len(np1_products) >= 300 and len(np2_products) == 0:
         incomplete = True  # nopromo page 2 empty when page 1 full
 
     normal_products = n1_products + n2_products
@@ -451,11 +499,8 @@ async def get_positions(article: int, keywords: list[str],
                         dest: int = DEST) -> dict[str, dict]:
     """Get organic + promo positions for an article across multiple keywords.
 
-    Same logic as old Chrome JS approach:
-    - Keywords processed SEQUENTIALLY (one after another)
-    - Inside each keyword: 4 fetches in PARALLEL (Promise.all equivalent)
-    - Max 4 concurrent requests to WB at any moment
-    - Proxy rotates per keyword (round-robin)
+    Keywords and their four page requests are processed sequentially. A classified
+    access failure stops the batch so one anti-bot response cannot create a burst.
 
     Returns: {
         "keyword": {"promo_pos": 16, "organic_pos": 436, "is_advertised": True},
@@ -475,6 +520,7 @@ async def get_positions(article: int, keywords: list[str],
     logger.info("Fetching positions for %d: %d keywords (%s)", article, len(keywords), mode)
 
     result = {}
+    blocked_error = None
 
     # Session for connection reuse (T08 strategy)
     session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE) if not proxy_raw else None
@@ -492,9 +538,29 @@ async def get_positions(article: int, keywords: list[str],
 
         # Retry once if error (empty page, HTTP error)
         if item.get("error"):
-            logger.warning("Retry '%s' for %d (empty/error response)", kw, article)
-            await asyncio.sleep(0.5)
-            item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
+            error_state = item.get("error_state")
+            if not error_state:
+                logger.warning("Retry '%s' for %d (incomplete response)", kw, article)
+                await asyncio.sleep(0.5)
+                item = await asyncio.to_thread(
+                    _fetch_keyword_sync, proxy_raw, kw, article, dest, session
+                )
+                error_state = item.get("error_state")
+
+            status_code = item.get("status_code")
+            error_message = item.get("error_message") or "WB returned incomplete search data"
+            if error_state == "antibot":
+                record_antibot(status_code, error_message, "position_parser")
+                blocked_error = item
+            elif error_state == "rate_limited":
+                record_rate_limit(status_code, error_message, "position_parser")
+                blocked_error = item
+            elif error_state == "auth_expired":
+                record_auth_expired(status_code, error_message, "position_parser")
+                blocked_error = item
+            elif error_state == "network_error":
+                record_network_error(status_code, error_message, "position_parser")
+                blocked_error = item
 
         result[kw] = {
             "promo_pos": item["promo_pos"],
@@ -503,12 +569,17 @@ async def get_positions(article: int, keywords: list[str],
             "preset_id": item.get("preset_id"),
             "tokens": item.get("tokens") or [],
             "error": item.get("error", False),
+            "error_state": item.get("error_state"),
+            "status_code": item.get("status_code"),
+            "error_message": item.get("error_message") or "",
         }
         logger.info(
             "Positions for %d '%s': promo=%s organic=%s is_ad=%s%s",
             article, kw, item["promo_pos"], item["organic_pos"], item["is_advertised"],
             " ERROR" if item.get("error") else "",
         )
+        if blocked_error:
+            break
 
     # Close session
     if session:
@@ -517,6 +588,16 @@ async def get_positions(article: int, keywords: list[str],
     # Fill missing keywords
     for kw in keywords:
         if kw not in result:
-            result[kw] = {"promo_pos": None, "organic_pos": None, "is_advertised": False, "preset_id": None, "tokens": [], "error": True}
+            result[kw] = {
+                "promo_pos": None,
+                "organic_pos": None,
+                "is_advertised": False,
+                "preset_id": None,
+                "tokens": [],
+                "error": True,
+                "error_state": (blocked_error or {}).get("error_state"),
+                "status_code": (blocked_error or {}).get("status_code"),
+                "error_message": (blocked_error or {}).get("error_message") or "",
+            }
 
     return result
