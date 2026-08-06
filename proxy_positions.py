@@ -19,6 +19,7 @@ from typing import Optional
 from curl_cffi import requests as curl_requests
 
 import config
+from wb_health import WB_BROWSER_USER_AGENT, WB_CURL_IMPERSONATE
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +106,7 @@ def _refresh_wbaas_token(proxy_raw: str = None) -> str:
             headless=True,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        ctx_kwargs = {
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/141.0.0.0 Safari/537.36"
-            ),
-        }
+        ctx_kwargs = {"user_agent": WB_BROWSER_USER_AGENT}
         if proxy_conf:
             ctx_kwargs["proxy"] = proxy_conf
         ctx = browser.new_context(**ctx_kwargs)
@@ -166,11 +161,7 @@ def refresh_wbaas_tokens():
 
 # ── Search API ──
 
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/141.0.0.0 Safari/537.36"
-)
+_UA = WB_BROWSER_USER_AGENT
 
 SEARCH_URL = "https://www.wildberries.ru/__internal/search/exactmatch/ru/common/v18/search"
 
@@ -278,7 +269,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         kwargs = {
             "params": params,
             "headers": headers,
-            "impersonate": "chrome",
+            "impersonate": WB_CURL_IMPERSONATE,
             "timeout": 10,
         }
         if proxy_url:
@@ -473,6 +464,8 @@ async def get_positions(article: int, keywords: list[str],
     """
     if not _token_cache:
         _load_token_cache()
+    if not _wb_session:
+        _load_wb_session()
 
     # Direct mode (no proxies) or proxy mode
     proxy_raw = config.WB_PROXIES[0] if config.WB_PROXIES else ""
@@ -484,7 +477,7 @@ async def get_positions(article: int, keywords: list[str],
     result = {}
 
     # Session for connection reuse (T08 strategy)
-    session = curl_requests.Session(impersonate="chrome") if not proxy_raw else None
+    session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE) if not proxy_raw else None
 
     for kw in keywords:
 

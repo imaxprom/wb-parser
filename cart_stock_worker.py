@@ -21,6 +21,22 @@ from curl_cffi import requests as curl_requests
 import config
 import proxy_positions
 from wb_session_runtime import refresh_saved_session
+from wb_health import (
+    ANTIBOT_HTTP_STATUSES,
+    RATE_LIMIT_HTTP_STATUSES,
+    WB_CURL_IMPERSONATE,
+    WbAntibotError,
+    WbAuthExpiredError,
+    WbRateLimitError,
+    build_antibot_error,
+    get_access_health,
+    probe_delay_seconds,
+    record_antibot,
+    record_auth_expired,
+    record_network_error,
+    record_rate_limit,
+    record_success,
+)
 
 
 WB_CARD_ENDPOINT = "https://www.wildberries.ru/__internal/card/cards/v4/detail"
@@ -133,13 +149,14 @@ class CartStockWorker:
             raise RuntimeError("MPHUB_CART_STOCK_WORKER_SECRET is not configured")
         self.worker_id = config.CART_STOCK_WORKER_ID
         self.site_base = config.MPHUB_CART_STOCK_URL.rstrip("/")
-        self.site_session = curl_requests.Session(impersonate="chrome")
-        self.wb_session = curl_requests.Session(impersonate="chrome")
+        self.site_session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE)
+        self.wb_session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE)
         self.outbox = Outbox(os.path.join(config.DATA_DIR, "cart_stock_worker.db"))
         self.last_heartbeat = 0.0
         self.last_wb_success_at: str | None = None
         self.last_error: str | None = None
         self.auth_state = "unknown"
+        self.last_cooldown_log_at = 0.0
 
     def _signed_headers(self, method: str, path: str, raw_body: str) -> dict:
         timestamp = str(int(time.time()))
@@ -204,15 +221,23 @@ class CartStockWorker:
         if not force and now - self.last_heartbeat < HEARTBEAT_SECONDS:
             return
         auth = self.auth_metadata()
-        error = self.last_error or auth.get("authError")
+        access = get_access_health()
+        access_error = access.get("last_error") if access.get("state") != "healthy" else None
+        error = access_error or self.last_error or auth.get("authError")
+        last_success_at = access.get("last_success_at") or 0
         self.site_request(
             "/api/internal/cart-stock/worker/heartbeat",
             {
                 "authState": auth["authState"],
                 "bearerExpiresAt": auth["bearerExpiresAt"],
-                "lastWbSuccessAt": self.last_wb_success_at,
+                "lastWbSuccessAt": self.last_wb_success_at or (
+                    utc_iso(last_success_at) if last_success_at else None
+                ),
                 "lastError": error,
                 "outboxCount": self.outbox.count(),
+                "wbAccessState": access.get("state"),
+                "wbHttpStatus": access.get("last_status"),
+                "wbRetryAt": utc_iso(access.get("retry_at")) if access.get("retry_at") else None,
             },
         )
         self.last_heartbeat = now
@@ -224,10 +249,25 @@ class CartStockWorker:
             self.heartbeat(force=True)
         except Exception as error:
             logger.warning("Could not report auth refresh state to MpHub: %s", error)
-        refresh_saved_session()
-        proxy_positions._load_token_cache()
-        proxy_positions._load_wb_session()
-        self.auth_state = "ok"
+        try:
+            refresh_saved_session()
+            proxy_positions._load_token_cache()
+            proxy_positions._load_wb_session()
+            self.auth_state = "ok"
+        except WbAntibotError as error:
+            # The saved buyer tokens still exist; WB blocked this IP/browser instead.
+            record_antibot(
+                error.status_code,
+                str(error),
+                "cart_stock_auth_refresh",
+                minimum_cooldown_seconds=error.retry_after_seconds or 0,
+            )
+            self.auth_state = "ok"
+            raise
+        except WbAuthExpiredError as error:
+            record_auth_expired(error.status_code, str(error), "cart_stock_auth_refresh")
+            self.auth_state = "error"
+            raise
 
     def _request_wb_batch(self, articles: list[str], allow_refresh: bool = True) -> list[dict]:
         headers, _ = self._auth_headers()
@@ -246,15 +286,44 @@ class CartStockWorker:
             headers=headers,
             timeout=WB_TIMEOUT_SECONDS,
         )
-        if response.status_code in (401, 498) and allow_refresh:
+        if response.status_code == 401 and allow_refresh:
             self.refresh_auth()
             return self._request_wb_batch(articles, allow_refresh=False)
+        if response.status_code == 401:
+            error = WbAuthExpiredError(
+                "WB rejected the buyer session after refresh: HTTP 401",
+                status_code=401,
+            )
+            record_auth_expired(401, str(error), "cart_stock_worker")
+            self.auth_state = "error"
+            raise error
+        if response.status_code in ANTIBOT_HTTP_STATUSES:
+            error = build_antibot_error(response.status_code, response.text[:2000])
+            health = record_antibot(response.status_code, str(error), "cart_stock_worker")
+            retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
+            logger.warning(
+                "WB anti-bot detected: HTTP %s; auth refresh skipped; retry in %d minutes",
+                response.status_code,
+                retry_minutes,
+            )
+            raise error
+        if response.status_code in RATE_LIMIT_HTTP_STATUSES:
+            error = WbRateLimitError(
+                f"WB rate limit is active: HTTP {response.status_code}",
+                status_code=response.status_code,
+            )
+            record_rate_limit(response.status_code, str(error), "cart_stock_worker")
+            raise error
         if response.status_code != 200:
-            raise RuntimeError(f"Authorized WB card returned HTTP {response.status_code}")
+            error = f"Authorized WB card returned HTTP {response.status_code}"
+            if response.status_code >= 500:
+                record_network_error(response.status_code, error, "cart_stock_worker")
+            raise RuntimeError(error)
         data = response.json()
         products = data.get("products")
         if not isinstance(products, list):
             raise RuntimeError("Authorized WB card returned no products array")
+        record_success("cart_stock_worker")
         return products
 
     @staticmethod
@@ -372,6 +441,18 @@ class CartStockWorker:
         if not self.flush_outbox():
             return False
         self.heartbeat()
+        access = get_access_health()
+        retry_delay = probe_delay_seconds(access)
+        if retry_delay > 0:
+            now = time.time()
+            if now - self.last_cooldown_log_at >= HEARTBEAT_SECONDS:
+                logger.warning(
+                    "WB jobs paused: access state=%s, retry in %d seconds",
+                    access.get("state"),
+                    retry_delay,
+                )
+                self.last_cooldown_log_at = now
+            return False
         job = self.claim()
         if not job:
             return False
@@ -381,14 +462,17 @@ class CartStockWorker:
             payload = self.collect(job)
         except Exception as error:
             self.last_error = str(error)[:2000]
-            self.auth_state = "error" if "session" in self.last_error.lower() else self.auth_state
+            if isinstance(error, WbAuthExpiredError):
+                self.auth_state = "error"
+            elif isinstance(error, (WbAntibotError, WbRateLimitError)):
+                self.auth_state = "ok"
             logger.exception("Cart-stock job %s failed", job.get("jobId"))
             payload = {
                 "jobId": int(job["jobId"]),
                 "claimToken": str(job["claimToken"]),
                 "status": "error",
                 "error": self.last_error,
-                "authenticated": False,
+                "authenticated": not isinstance(error, WbAuthExpiredError),
                 "endpoint": WB_CARD_PATH,
             }
         self.outbox.put(int(job["jobId"]), payload)
@@ -421,12 +505,16 @@ def main():
     worker = CartStockWorker()
     if args.check:
         auth = worker.auth_metadata()
+        access = get_access_health()
         host = urlsplit(worker.site_base).hostname
         print(json.dumps({
-            "ok": auth.get("authState") == "ok",
+            "ok": auth.get("authState") == "ok" and access.get("state") in ("healthy", "unknown"),
             "workerId": worker.worker_id,
             "siteHost": host,
             "authState": auth.get("authState"),
+            "wbAccessState": access.get("state"),
+            "wbHttpStatus": access.get("last_status"),
+            "wbRetryAt": utc_iso(access.get("retry_at")) if access.get("retry_at") else None,
             "bearerExpiresAt": auth.get("bearerExpiresAt"),
             "outboxCount": worker.outbox.count(),
         }, ensure_ascii=False))

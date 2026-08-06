@@ -10,13 +10,15 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import config
-
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/141.0.0.0 Safari/537.36"
+from wb_health import (
+    WB_BROWSER_USER_AGENT,
+    WbAuthExpiredError,
+    build_antibot_error,
+    is_antibot_response,
 )
+
+
+USER_AGENT = WB_BROWSER_USER_AGENT
 
 
 def _atomic_json_dump(path: Path, data):
@@ -113,13 +115,18 @@ def refresh_saved_session() -> dict:
                     'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
                 )
                 page = context.new_page()
-                page.goto(
+                home_response = page.goto(
                     "https://www.wildberries.ru/",
                     timeout=30000,
                     wait_until="domcontentloaded",
                 )
                 page.wait_for_timeout(3000)
-                page.goto(
+                home_body = _safe_body_text(page)
+                home_status = home_response.status if home_response else None
+                if is_antibot_response(home_status, home_body):
+                    raise build_antibot_error(home_status, home_body)
+
+                lk_response = page.goto(
                     "https://www.wildberries.ru/lk",
                     timeout=30000,
                     wait_until="domcontentloaded",
@@ -127,8 +134,24 @@ def refresh_saved_session() -> dict:
                 page.wait_for_timeout(5000)
 
                 body = _safe_body_text(page)
-                if "/lk" not in page.url or not ("Профиль" in body or "Заказы" in body):
-                    raise RuntimeError(
+                lk_status = lk_response.status if lk_response else None
+                if is_antibot_response(lk_status, body):
+                    raise build_antibot_error(lk_status, body)
+
+                local_storage = page.evaluate(
+                    """() => ({
+                        sysAuth: localStorage.getItem("_sys_auth") || "",
+                        bearer: !!localStorage.getItem("wbx__tokenData")
+                    })"""
+                )
+                login_url = "/security/login" in page.url or "id.wb.ru" in page.url
+                logged_out = (
+                    login_url
+                    or not local_storage.get("bearer")
+                    or local_storage.get("sysAuth") in ("", "unauth")
+                )
+                if logged_out:
+                    raise WbAuthExpiredError(
                         "Saved WB session no longer opens the buyer account; manual SMS login is required"
                     )
                 return _save_session(context, page)
