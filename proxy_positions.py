@@ -173,7 +173,9 @@ def refresh_wbaas_tokens():
 
 _UA = WB_BROWSER_USER_AGENT
 
-SEARCH_URL = "https://www.wildberries.ru/__internal/search/exactmatch/ru/common/v18/search"
+# The www/__internal route is challenged with HTTP 498 from the production IP,
+# while WB's search host serves the same v18 payload and current ad positions.
+SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v18/search"
 
 # Authenticated session data (from wb_session.json)
 _wb_session: dict = {}
@@ -480,9 +482,8 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
     # Mark as error — triggers retry
     if incomplete and promo_pos is None and organic_pos is None:
         result["error"] = True
-    # Ad product found in normal but missing in nopromo = nopromo data incomplete
-    if is_ad and promo_pos is not None and organic_pos is None:
-        result["error"] = True
+    # A promoted product may legitimately be outside the organic top-600.
+    # The promo position is still valid when both no-promo pages are complete.
     # Both None = either WB glitch or genuinely not found, check incomplete
     if promo_pos is None and organic_pos is None and incomplete:
         result["error"] = True
@@ -492,7 +493,7 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
 
 # ── Public API (same interface as chrome_positions) ──
 
-DEST = -951305  # Moscow region
+DEST = int(config.WB_DEST)
 
 
 async def get_positions(article: int, keywords: list[str],
