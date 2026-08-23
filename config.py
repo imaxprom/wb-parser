@@ -28,6 +28,7 @@ CART_STOCK_WORKER_POLL_SECONDS = max(
     int(os.getenv("CART_STOCK_WORKER_POLL_SECONDS", "10")),
 )
 CART_STOCK_DEST = os.getenv("CART_STOCK_DEST", "-364001")
+CART_STOCK_BROWSER_PROXY = os.getenv("CART_STOCK_BROWSER_PROXY", "").strip()
 
 # Proxies (user:pass@host:port)
 WB_PROXIES = []

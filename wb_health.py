@@ -122,27 +122,47 @@ def _default_state() -> dict:
     }
 
 
-def _load_unlocked() -> dict:
+def _paths(scope: str | None = None) -> tuple[Path, Path]:
+    """Return isolated state files for a WB consumer.
+
+    The legacy/default scope is intentionally unchanged so position parsing and
+    the Telegram bot keep their existing cooldown.  Independent consumers such
+    as the cart-stock worker must not inherit that cooldown: WB can reject one
+    internal endpoint while another one remains available.
+    """
+    if not scope:
+        return _STATE_PATH, _LOCK_PATH
+    safe_scope = re.sub(r"[^a-zA-Z0-9_-]+", "_", scope).strip("_")
+    if not safe_scope:
+        raise ValueError("WB health scope must contain letters or digits")
+    return (
+        _STATE_PATH.with_name(f"{_STATE_PATH.stem}_{safe_scope}{_STATE_PATH.suffix}"),
+        _LOCK_PATH.with_name(f"{_LOCK_PATH.stem}_{safe_scope}{_LOCK_PATH.suffix}"),
+    )
+
+
+def _load_unlocked(state_path: Path) -> dict:
     try:
-        saved = json.loads(_STATE_PATH.read_text(encoding="utf-8"))
+        saved = json.loads(state_path.read_text(encoding="utf-8"))
     except Exception:
         saved = {}
     return {**_default_state(), **saved}
 
 
-def _save_unlocked(state: dict):
-    temporary = _STATE_PATH.with_name(f"{_STATE_PATH.name}.tmp.{os.getpid()}")
+def _save_unlocked(state: dict, state_path: Path):
+    temporary = state_path.with_name(f"{state_path.name}.tmp.{os.getpid()}")
     temporary.write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    os.replace(temporary, _STATE_PATH)
+    os.replace(temporary, state_path)
 
 
-def get_access_health() -> dict:
-    with _LOCK_PATH.open("a+") as lock_file:
+def get_access_health(scope: str | None = None) -> dict:
+    state_path, lock_path = _paths(scope)
+    with lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
-        return _load_unlocked()
+        return _load_unlocked(state_path)
 
 
 def probe_delay_seconds(state: dict | None = None, now: float | None = None) -> int:
@@ -163,11 +183,13 @@ def _record_failure(
     cooldown_seconds: int,
     *,
     escalating: bool = False,
+    scope: str | None = None,
 ) -> dict:
     now = time.time()
-    with _LOCK_PATH.open("a+") as lock_file:
+    state_path, lock_path = _paths(scope)
+    with lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        state = _load_unlocked()
+        state = _load_unlocked(state_path)
         previous_failures = int(state.get("consecutive_failures") or 0)
         failures = previous_failures + 1 if state.get("state") == state_name else 1
         if escalating:
@@ -184,7 +206,7 @@ def _record_failure(
             "last_checked_at": now,
             "source": source,
         })
-        _save_unlocked(state)
+        _save_unlocked(state, state_path)
         return state
 
 
@@ -194,6 +216,7 @@ def record_antibot(
     source: str,
     *,
     minimum_cooldown_seconds: int = 0,
+    scope: str | None = None,
 ) -> dict:
     return _record_failure(
         "antibot",
@@ -202,44 +225,67 @@ def record_antibot(
         source,
         max(ANTIBOT_BASE_COOLDOWN_SECONDS, minimum_cooldown_seconds),
         escalating=True,
+        scope=scope,
     )
 
 
-def record_rate_limit(status_code: int | None, error: str, source: str) -> dict:
+def record_rate_limit(
+    status_code: int | None,
+    error: str,
+    source: str,
+    *,
+    scope: str | None = None,
+) -> dict:
     return _record_failure(
         "rate_limited",
         status_code,
         error,
         source,
         RATE_LIMIT_COOLDOWN_SECONDS,
+        scope=scope,
     )
 
 
-def record_network_error(status_code: int | None, error: str, source: str) -> dict:
+def record_network_error(
+    status_code: int | None,
+    error: str,
+    source: str,
+    *,
+    scope: str | None = None,
+) -> dict:
     return _record_failure(
         "network_error",
         status_code,
         error,
         source,
         NETWORK_ERROR_COOLDOWN_SECONDS,
+        scope=scope,
     )
 
 
-def record_auth_expired(status_code: int | None, error: str, source: str) -> dict:
+def record_auth_expired(
+    status_code: int | None,
+    error: str,
+    source: str,
+    *,
+    scope: str | None = None,
+) -> dict:
     return _record_failure(
         "auth_expired",
         status_code,
         error,
         source,
         AUTH_EXPIRED_RECHECK_SECONDS,
+        scope=scope,
     )
 
 
-def record_success(source: str) -> dict:
+def record_success(source: str, *, scope: str | None = None) -> dict:
     now = time.time()
-    with _LOCK_PATH.open("a+") as lock_file:
+    state_path, lock_path = _paths(scope)
+    with lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        state = _load_unlocked()
+        state = _load_unlocked(state_path)
         state.update({
             "state": "healthy",
             "consecutive_failures": 0,
@@ -250,5 +296,5 @@ def record_success(source: str) -> dict:
             "last_success_at": now,
             "source": source,
         })
-        _save_unlocked(state)
+        _save_unlocked(state, state_path)
         return state

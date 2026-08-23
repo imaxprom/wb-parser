@@ -47,17 +47,61 @@ class WbHealthTest(unittest.TestCase):
         worker = CartStockWorker.__new__(CartStockWorker)
         worker._auth_headers = Mock(return_value=({"Authorization": "Bearer token"}, "token"))
         worker.refresh_auth = Mock()
-        worker.wb_session = Mock()
-        worker.wb_session.get.return_value = SimpleNamespace(
-            status_code=498,
-            text="Подозрительная активность",
+        worker._browser_card_request = Mock(
+            return_value=(498, "Подозрительная активность"),
         )
 
         with self.assertRaises(wb_health.WbAntibotError):
             worker._request_wb_batch(["123"])
 
         worker.refresh_auth.assert_not_called()
+        self.assertEqual(wb_health.get_access_health("cart_stock")["state"], "antibot")
+        self.assertEqual(wb_health.get_access_health()["state"], "unknown")
+
+    def test_position_cooldown_does_not_pause_cart_stock_worker(self):
+        wb_health.record_antibot(498, "search endpoint blocked", "bot_pre_parse")
+        worker = CartStockWorker.__new__(CartStockWorker)
+        worker.flush_outbox = Mock(return_value=True)
+        worker.browser_proxy_available = Mock(return_value=True)
+        worker.heartbeat = Mock()
+        worker.claim = Mock(return_value=None)
+        worker.last_cooldown_log_at = 0.0
+
+        self.assertFalse(worker.process_once())
+
+        worker.claim.assert_called_once_with()
         self.assertEqual(wb_health.get_access_health()["state"], "antibot")
+        self.assertEqual(wb_health.get_access_health("cart_stock")["state"], "unknown")
+
+    def test_cart_stock_cooldown_still_pauses_cart_stock_worker(self):
+        wb_health.record_antibot(
+            498,
+            "card endpoint blocked",
+            "cart_stock_worker",
+            scope="cart_stock",
+        )
+        worker = CartStockWorker.__new__(CartStockWorker)
+        worker.flush_outbox = Mock(return_value=True)
+        worker.browser_proxy_available = Mock(return_value=True)
+        worker.heartbeat = Mock()
+        worker.claim = Mock(return_value=None)
+        worker.last_cooldown_log_at = 0.0
+
+        self.assertFalse(worker.process_once())
+
+        worker.claim.assert_not_called()
+
+    def test_unavailable_browser_tunnel_does_not_claim_a_job(self):
+        worker = CartStockWorker.__new__(CartStockWorker)
+        worker.flush_outbox = Mock(return_value=True)
+        worker.browser_proxy_available = Mock(return_value=False)
+        worker.heartbeat = Mock()
+        worker.claim = Mock(return_value=None)
+
+        self.assertFalse(worker.process_once())
+
+        worker.heartbeat.assert_called_once_with()
+        worker.claim.assert_not_called()
 
     def test_position_search_classifies_401_as_expired_auth(self):
         session = Mock()
