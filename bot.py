@@ -33,22 +33,12 @@ import alerts
 import xlsx_loader
 from wb_health import (
     ANTIBOT_HTTP_STATUSES,
-    AUTH_HTTP_STATUSES,
     RATE_LIMIT_HTTP_STATUSES,
     WB_BROWSER_USER_AGENT,
     WB_CURL_IMPERSONATE,
     WbAntibotError,
-    WbAuthExpiredError,
     WbRateLimitError,
     build_antibot_error,
-    can_probe_wb,
-    get_access_health,
-    probe_delay_seconds,
-    record_antibot,
-    record_auth_expired,
-    record_network_error,
-    record_rate_limit,
-    record_success,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -206,9 +196,6 @@ class WbSessionJob:
 
 
 _wb_session_jobs: dict[int, WbSessionJob] = {}
-_last_wb_alert_at: dict[str, float] = {}
-_WB_SESSION_ALERT_COOLDOWN = 6 * 60 * 60
-_WB_MANUAL_HEALTH_FRESH_SECONDS = 5 * 60
 
 
 def _get_wb_session_task_lock() -> asyncio.Lock:
@@ -216,87 +203,6 @@ def _get_wb_session_task_lock() -> asyncio.Lock:
     if _wb_session_task_lock is None:
         _wb_session_task_lock = asyncio.Lock()
     return _wb_session_task_lock
-
-
-def _get_owner_id() -> int | None:
-    owner = next((u for u in db.get_allowed_users() if u.get("is_owner")), None)
-    return int(owner["telegram_id"]) if owner else None
-
-
-async def _notify_owner_wb_session_problem(
-    text: str,
-    *,
-    throttle: bool = True,
-    category: str = "session",
-    title: str = "WB-сессия требует внимания",
-):
-    owner_id = _get_owner_id()
-    if not owner_id:
-        logger.warning("WB session problem, but owner is not configured: %s", text)
-        return
-
-    now = time.time()
-    last_alert_at = _last_wb_alert_at.get(category, 0.0)
-    if throttle and now - last_alert_at < _WB_SESSION_ALERT_COOLDOWN:
-        logger.warning("WB %s alert throttled: %s", category, text)
-        return
-    _last_wb_alert_at[category] = now
-
-    try:
-        await bot.send_message(
-            owner_id,
-            f"⚠️ <b>{escape(title)}</b>\n\n" + escape(text),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.warning("WB session owner notify failed: %s", e)
-
-
-def _wb_access_problem_text(health: dict) -> str:
-    state = str(health.get("state") or "unknown")
-    status_code = health.get("last_status")
-    retry_delay = probe_delay_seconds(health)
-    retry_minutes = max(1, (retry_delay + 59) // 60) if retry_delay else 0
-    retry_text = f" Следующая проверка примерно через {retry_minutes} мин." if retry_minutes else ""
-
-    if state == "antibot":
-        return (
-            "🛡 <b>WB включил антибот-защиту</b>\n\n"
-            f"Авторизация сохранена, но запросы временно заблокированы (HTTP {status_code})."
-            f"{retry_text}"
-        )
-    if state == "rate_limited":
-        return (
-            "⏳ <b>WB ограничил частоту запросов</b>\n\n"
-            f"Авторизация активна.{retry_text}"
-        )
-    if state == "auth_expired":
-        return (
-            "🔐 <b>WB-сессия действительно истекла</b>\n\n"
-            "Нужно обновить авторизацию в настройках бота."
-        )
-    return (
-        "⚠️ <b>WB временно недоступен</b>\n\n"
-        f"Последняя ошибка: HTTP {status_code or '—'}.{retry_text}"
-    )
-
-
-async def _ensure_wb_access_for_manual_parse() -> tuple[bool, str]:
-    health = get_access_health()
-    if probe_delay_seconds(health) > 0:
-        return False, _wb_access_problem_text(health)
-
-    last_checked_at = float(health.get("last_checked_at") or 0)
-    health_is_fresh = (
-        health.get("state") == "healthy"
-        and time.time() - last_checked_at <= _WB_MANUAL_HEALTH_FRESH_SECONDS
-    )
-    if health_is_fresh:
-        return True, ""
-
-    if await ensure_wb_session_for_parse():
-        return True, ""
-    return False, _wb_access_problem_text(get_access_health())
 
 
 def _normalize_ru_phone(raw: str) -> str | None:
@@ -482,57 +388,6 @@ def _wb_context_has_auth_tokens(ctx, page) -> tuple[bool, dict]:
         "sys_auth": ls_data.get("_sys_auth", ""),
     }
     return bool(checks["bearer"] and checks["pow"] and checks["wbaas"]), checks
-
-
-def _run_wb_session_keepalive_sync() -> dict:
-    """Refresh WB cookies from an already-authorized Playwright state."""
-    from wb_session_runtime import refresh_saved_session
-    return refresh_saved_session()
-
-    # Legacy implementation retained below for the SMS-login flow helpers.
-    from playwright.sync_api import sync_playwright
-
-    wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
-    if not os.path.exists(wb_state_path):
-        raise RuntimeError("Нет сохранённого Playwright state WB. Нужна ручная авторизация.")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        try:
-            ctx = browser.new_context(
-                storage_state=wb_state_path,
-                user_agent=WB_BROWSER_USER_AGENT,
-                viewport={"width": 1920, "height": 1080},
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-            )
-            ctx.add_init_script(
-                'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
-            )
-            page = ctx.new_page()
-            page.goto("https://www.wildberries.ru/", timeout=30000)
-            page.wait_for_timeout(3000)
-            page.goto("https://www.wildberries.ru/lk", timeout=30000)
-            page.wait_for_timeout(5000)
-
-            body = _safe_body_text(page, 1600)
-            is_lk = "/lk" in page.url and ("Профиль" in body or "Заказы" in body)
-            if not is_lk:
-                debug = _save_wb_login_debug(page, "keepalive_not_logged_in")
-                raise RuntimeError(
-                    "WB keepalive не смог открыть авторизованный ЛК. "
-                    f"URL={page.url}; title={page.title()!r}. "
-                    f"Debug: html={debug.get('html') or '-'}, "
-                    f"screenshot={debug.get('screenshot') or '-'}. "
-                    "Нужна ручная авторизация WB."
-                )
-
-            return _save_wb_session_from_context(ctx, page)
-        finally:
-            browser.close()
 
 
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
@@ -822,7 +677,6 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
                 f"HTTP {status_code}, товаров={products_count}."
             )
 
-        record_success("manual_session_update")
         await bot.send_message(
             job.chat_id,
             "✅ <b>WB-сессия обновлена</b>\n\n"
@@ -832,19 +686,19 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
             parse_mode="HTML",
         )
     except WbAntibotError as e:
-        health = record_antibot(
-            e.status_code,
-            str(e),
-            "manual_session_update",
-            minimum_cooldown_seconds=getattr(e, "retry_after_seconds", 0) or 0,
-        )
-        retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-        logger.warning("WB session was saved, but anti-bot is active: %s", e)
+        logger.warning("WB session was saved, but its manual verification was rejected: %s", e)
         await bot.send_message(
             job.chat_id,
-            "🛡 <b>WB включил антибот-защиту</b>\n\n"
-            "Повторный вход не требуется: сохранённая авторизация не удалена. "
-            f"Следующая автоматическая проверка примерно через {retry_minutes} мин.",
+            "⚠️ <b>WB временно отклонил проверку</b>\n\n"
+            "Новая авторизация сохранена. Автоматических повторов не будет; "
+            "повторите ручную проверку позже.",
+            parse_mode="HTML",
+        )
+    except WbRateLimitError:
+        await bot.send_message(
+            job.chat_id,
+            "⏳ <b>WB временно ограничил частоту</b>\n\n"
+            "Авторизация сохранена. Автоматических повторов не будет.",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -1557,9 +1411,8 @@ def format_results_all(all_results: dict, elapsed: float = None, uid: int = None
     return text
 
 
-# --- Organic/Promo positions via Chrome ---
+# --- Organic/Promo positions ---
 
-import chrome_positions
 from queue_worker import position_queue
 
 
@@ -1573,11 +1426,6 @@ async def run_evirma_handler(callback: CallbackQuery):
     msg_id = callback.message.message_id
 
     try:
-        access_ok, access_message = await _ensure_wb_access_for_manual_parse()
-        if not access_ok:
-            await callback.message.edit_text(access_message, parse_mode="HTML")
-            return
-
         if target == "all":
             await callback.message.edit_text("⏳ Проверяю все артикулы (Орг/Рекл)...")
             task = asyncio.create_task(_do_evirma_all(uid, chat_id, msg_id))
@@ -1678,8 +1526,9 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
         start = time.time()
         arts = db.get_articles(uid)
 
-        # Submit all tasks to queue
-        task_infos = []  # (article, queries, future)
+        # Build the local work list first, then submit one article at a time.
+        # If WB rejects one real request, no remaining articles are sent.
+        task_infos = []  # (article, queries, keywords)
         for article in arts:
             sku = article["sku"]
             nm_id = int(sku) if sku.isdigit() else 0
@@ -1689,8 +1538,7 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
             if not queries:
                 continue
             keywords = [q["query"] for q in queries]
-            future = await position_queue.submit(uid, nm_id, keywords, label=sku)
-            task_infos.append((article, queries, keywords, future))
+            task_infos.append((article, queries, keywords))
 
         if not task_infos:
             await bot.edit_message_text("Нет данных.", chat_id=chat_id, message_id=msg_id)
@@ -1702,10 +1550,9 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
             chat_id=chat_id, message_id=msg_id
         )
 
-        # Collect results as they complete
         all_blocks = []
         all_position_sets = []
-        for i, (article, queries, keywords, future) in enumerate(task_infos):
+        for i, (article, queries, keywords) in enumerate(task_infos):
             sku = article["sku"]
             art_name = article.get("name") or ""
 
@@ -1719,6 +1566,12 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
                 except Exception:
                     pass
 
+            future = await position_queue.submit(
+                uid,
+                int(sku),
+                keywords,
+                label=sku,
+            )
             positions = await future
             all_position_sets.append(positions)
 
@@ -1726,6 +1579,8 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
             all_blocks.append(lines)
 
             _save_evirma_positions(uid, article, queries, positions)
+            if any(item.get("error") for item in positions.values()):
+                break
 
         elapsed = time.time() - start
         now = datetime.now().strftime("%H:%M %d.%m")
@@ -1820,7 +1675,7 @@ def _evirma_error_notice(position_sets: list[dict]) -> str:
     statuses = sorted({item.get("status_code") for item in errors if item.get("status_code")})
     status_text = ", ".join(map(str, statuses)) or "—"
     if "antibot" in states:
-        reason = "WB включил антибот-защиту; авторизация не слетела"
+        reason = "WB временно отклонил запрос"
     elif "rate_limited" in states:
         reason = "WB ограничил частоту запросов"
     elif "auth_expired" in states:
@@ -2914,242 +2769,9 @@ def _format_shelf_results(sku: str, competitors: list, results: dict,
 
 # --- Scheduler ---
 
-async def _refresh_wb_session_from_saved_state(reason: str) -> tuple[int, int] | None:
-    lock = _get_wb_session_task_lock()
-    if lock.locked():
-        logger.info("WB session keepalive skipped (%s): another session task is running", reason)
-        return None
-
-    async with lock:
-        logger.info("WB session keepalive started (%s)", reason)
-        result = await asyncio.to_thread(_run_wb_session_keepalive_sync)
-        logger.info(
-            "WB session keepalive saved tokens (%s): account=%s wbauid=%s",
-            reason,
-            result.get("sys_auth") or "unknown",
-            result.get("wbauid") or "",
-        )
-        status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
-        if status_code != 200 or products_count <= 0:
-            if status_code in ANTIBOT_HTTP_STATUSES:
-                raise build_antibot_error(status_code)
-            if status_code in RATE_LIMIT_HTTP_STATUSES:
-                raise WbRateLimitError(
-                    f"WB rate limit is active: HTTP {status_code}",
-                    status_code=status_code,
-                )
-            if status_code in AUTH_HTTP_STATUSES:
-                raise WbAuthExpiredError(
-                    f"WB rejected the saved buyer session: HTTP {status_code}",
-                    status_code=status_code,
-                )
-            raise RuntimeError(
-                "WB endpoint did not return a usable response after keepalive: "
-                f"HTTP {status_code}, products={products_count}."
-            )
-        logger.info(
-            "WB session keepalive verified (%s): HTTP 200, products=%d",
-            reason,
-            products_count,
-        )
-        record_success(f"session_keepalive:{reason}")
-        return status_code, products_count
-
-
-async def scheduled_wb_session_keepalive():
-    health = get_access_health()
-    delay = probe_delay_seconds(health)
-    if delay > 0:
-        logger.warning(
-            "WB daily keepalive skipped: access state=%s, retry in %d seconds",
-            health.get("state"),
-            delay,
-        )
-        return
-    try:
-        await _refresh_wb_session_from_saved_state("daily")
-    except WbAntibotError as e:
-        health = record_antibot(
-            e.status_code,
-            str(e),
-            "bot_daily_keepalive",
-            minimum_cooldown_seconds=getattr(e, "retry_after_seconds", 0) or 0,
-        )
-        retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-        logger.warning("WB daily keepalive hit anti-bot: %s", e)
-        await _notify_owner_wb_session_problem(
-            "Авторизация сохранена, повторный вход не требуется. "
-            f"WB временно блокирует IP сервера (HTTP {e.status_code}). "
-            f"Следующая проверка примерно через {retry_minutes} мин.",
-            throttle=True,
-            category="antibot",
-            title="WB включил антибот-защиту",
-        )
-    except WbAuthExpiredError as e:
-        record_auth_expired(e.status_code, str(e), "bot_daily_keepalive")
-        logger.exception("WB session keepalive detected an expired login")
-        await _notify_owner_wb_session_problem(
-            f"Ежедневное обновление подтвердило выход из аккаунта: {e}\n\n"
-            "Нужна ручная авторизация WB.",
-            throttle=False,
-            category="session",
-        )
-    except WbRateLimitError as e:
-        health = record_rate_limit(e.status_code, str(e), "bot_daily_keepalive")
-        retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-        logger.warning("WB daily keepalive hit a rate limit: %s", e)
-        await _notify_owner_wb_session_problem(
-            f"Авторизация активна, но WB ограничил частоту запросов. "
-            f"Следующая проверка примерно через {retry_minutes} мин.",
-            throttle=True,
-            category="rate_limit",
-            title="WB ограничил частоту запросов",
-        )
-    except Exception as e:
-        record_network_error(getattr(e, "status_code", None), str(e), "bot_daily_keepalive")
-        logger.exception("WB session keepalive failed")
-        await _notify_owner_wb_session_problem(
-            "Ежедневная проверка WB завершилась технической ошибкой. "
-            f"{e}\n\nАвторизация автоматически не помечена как истёкшая.",
-            throttle=True,
-            category="network",
-            title="Ошибка доступа к WB",
-        )
-
-
-async def ensure_wb_session_for_parse() -> bool:
-    health = get_access_health()
-    delay = probe_delay_seconds(health)
-    if not can_probe_wb(health):
-        logger.warning(
-            "WB pre-parse check skipped: access state=%s, retry in %d seconds",
-            health.get("state"),
-            delay,
-        )
-        return False
-
-    try:
-        status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
-        if status_code == 200 and products_count > 0:
-            logger.info("WB session pre-parse check OK: products=%d", products_count)
-            record_success("bot_pre_parse")
-            return True
-
-        logger.warning(
-            "WB session pre-parse check failed: HTTP %s, products=%s",
-            status_code,
-            products_count,
-        )
-
-        if status_code in ANTIBOT_HTTP_STATUSES:
-            error = build_antibot_error(status_code)
-            health = record_antibot(status_code, str(error), "bot_pre_parse")
-            retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-            logger.warning(
-                "WB anti-bot detected: HTTP %s, retry in %d minutes; auth refresh skipped",
-                status_code,
-                retry_minutes,
-            )
-            await _notify_owner_wb_session_problem(
-                "Авторизация сохранена, повторный вход не требуется. "
-                f"WB временно блокирует IP сервера (HTTP {status_code}). "
-                f"Запросы приостановлены примерно на {retry_minutes} мин.",
-                throttle=True,
-                category="antibot",
-                title="WB включил антибот-защиту",
-            )
-            return False
-
-        if status_code in RATE_LIMIT_HTTP_STATUSES:
-            error = f"WB rate limit is active: HTTP {status_code}"
-            health = record_rate_limit(status_code, error, "bot_pre_parse")
-            retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-            logger.warning("WB rate limit detected; retry in %d minutes", retry_minutes)
-            await _notify_owner_wb_session_problem(
-                f"Авторизация активна, но WB ограничил частоту запросов. "
-                f"Проверки приостановлены примерно на {retry_minutes} мин.",
-                throttle=True,
-                category="rate_limit",
-                title="WB ограничил частоту запросов",
-            )
-            return False
-
-        if status_code not in AUTH_HTTP_STATUSES:
-            error = f"WB health check failed: HTTP {status_code}, products={products_count}"
-            record_network_error(status_code, error, "bot_pre_parse")
-            logger.warning("WB technical failure; auth refresh skipped: %s", error)
-            await _notify_owner_wb_session_problem(
-                f"Проверка WB завершилась технической ошибкой: HTTP {status_code}. "
-                "Авторизация автоматически не помечена как истёкшая.",
-                throttle=True,
-                category="network",
-                title="Ошибка доступа к WB",
-            )
-            return False
-
-        logger.warning("WB returned HTTP 401; attempting saved-state auth refresh")
-        refreshed = await _refresh_wb_session_from_saved_state(f"pre_parse_http_{status_code}")
-        if refreshed is None:
-            return False
-        return True
-    except WbAntibotError as e:
-        health = record_antibot(
-            e.status_code,
-            str(e),
-            "bot_auth_refresh",
-            minimum_cooldown_seconds=getattr(e, "retry_after_seconds", 0) or 0,
-        )
-        retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-        logger.warning("WB auth refresh hit anti-bot; session remains saved: %s", e)
-        await _notify_owner_wb_session_problem(
-            "Сохранённая авторизация присутствует, но браузер попал под антибот WB. "
-            f"Повторный вход не требуется; следующая проверка примерно через {retry_minutes} мин.",
-            throttle=True,
-            category="antibot",
-            title="WB включил антибот-защиту",
-        )
-        return False
-    except WbAuthExpiredError as e:
-        record_auth_expired(e.status_code, str(e), "bot_auth_refresh")
-        logger.exception("WB saved-state auth refresh confirmed an expired session")
-        await _notify_owner_wb_session_problem(
-            f"WB подтвердил выход из аккаунта: {e}\n\nНужна ручная авторизация WB.",
-            throttle=True,
-            category="session",
-        )
-        return False
-    except WbRateLimitError as e:
-        health = record_rate_limit(e.status_code, str(e), "bot_auth_refresh")
-        retry_minutes = max(1, (probe_delay_seconds(health) + 59) // 60)
-        logger.warning("WB auth refresh verification hit a rate limit: %s", e)
-        await _notify_owner_wb_session_problem(
-            f"Авторизация активна, но WB ограничил частоту запросов. "
-            f"Следующая проверка примерно через {retry_minutes} мин.",
-            throttle=True,
-            category="rate_limit",
-            title="WB ограничил частоту запросов",
-        )
-        return False
-    except Exception as e:
-        record_network_error(getattr(e, "status_code", None), str(e), "bot_pre_parse")
-        logger.exception("WB session pre-parse recovery failed")
-        await _notify_owner_wb_session_problem(
-            "Проверка WB завершилась технической ошибкой. "
-            f"{e}\n\nАвторизация автоматически не помечена как истёкшая.",
-            throttle=True,
-            category="network",
-            title="Ошибка доступа к WB",
-        )
-        return False
-
-
 async def scheduled_parse():
-    """Auto-parse for all users with auto_check articles using Chrome positions."""
+    """Auto-parse only articles that users explicitly enabled."""
     logger.info("Scheduled auto-parse started")
-    if not await ensure_wb_session_for_parse():
-        logger.warning("Scheduled auto-parse skipped: WB session is not healthy")
-        return
-
     users = db.get_allowed_users()
 
     async def parse_user(uid):
@@ -3163,7 +2785,6 @@ async def scheduled_parse():
             all_position_sets = []
             start = time.time()
 
-            # Submit all to queue
             task_infos = []
             for article in arts:
                 sku = article["sku"]
@@ -3174,18 +2795,25 @@ async def scheduled_parse():
                 if not queries_list:
                     continue
                 keywords = [q["query"] for q in queries_list]
-                future = await position_queue.submit(uid, nm_id, keywords, label=sku)
-                task_infos.append((article, queries_list, keywords, future))
+                task_infos.append((article, queries_list, keywords))
 
-            for article, queries_list, keywords, future in task_infos:
+            for article, queries_list, keywords in task_infos:
                 sku = article["sku"]
                 art_name = article.get("name") or ""
+                future = await position_queue.submit(
+                    uid,
+                    int(sku),
+                    keywords,
+                    label=sku,
+                )
                 positions = await future
                 all_position_sets.append(positions)
                 lines = _format_evirma_block(sku, keywords, positions, name=art_name)
                 all_blocks.append(lines)
 
                 _save_evirma_positions(uid, article, queries_list, positions)
+                if any(item.get("error") for item in positions.values()):
+                    break
 
             elapsed = time.time() - start
 
@@ -3240,23 +2868,10 @@ def reschedule_parser():
     logger.info(f"Scheduler set to {interval} min interval")
 
 
-def schedule_wb_session_keepalive():
-    scheduler.add_job(
-        scheduled_wb_session_keepalive,
-        trigger=IntervalTrigger(hours=24),
-        id="wb_session_keepalive",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    logger.info("WB session keepalive scheduled every 24h")
-
-
 # --- Main ---
 
 async def main():
     reschedule_parser()
-    schedule_wb_session_keepalive()
     scheduler.start()
     await position_queue.start()
 
@@ -3267,10 +2882,4 @@ async def main():
 
 if __name__ == "__main__":
     db.init_db()
-    # Get x_wbaas_token BEFORE starting asyncio loop
-    if config.PARSE_MODE == "proxy":
-        import proxy_positions
-        proxy_positions.refresh_wbaas_tokens()
-    else:
-        parser.refresh_wbaas_token_sync()
     asyncio.run(main())

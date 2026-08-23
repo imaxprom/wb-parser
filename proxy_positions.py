@@ -25,10 +25,6 @@ from wb_health import (
     RATE_LIMIT_HTTP_STATUSES,
     WB_BROWSER_USER_AGENT,
     WB_CURL_IMPERSONATE,
-    record_antibot,
-    record_auth_expired,
-    record_network_error,
-    record_rate_limit,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,11 +69,6 @@ def _load_token_cache():
         _token_cache = {}
 
 
-def _save_token_cache():
-    with open(_WBAAS_CACHE, "w") as f:
-        json.dump(_token_cache, f)
-
-
 def _get_wbaas_token(proxy_raw: str) -> str:
     """Get cached x_wbaas_token for a proxy."""
     entry = _token_cache.get(proxy_raw, {})
@@ -87,86 +78,6 @@ def _get_wbaas_token(proxy_raw: str) -> str:
     if token and (time.time() - updated) < 12 * 86400:
         return token
     return ""
-
-
-def _refresh_wbaas_token(proxy_raw: str = None) -> str:
-    """Get x_wbaas_token via Playwright. proxy_raw=None for direct mode."""
-    from playwright.sync_api import sync_playwright
-
-    proxy_conf = None
-    if proxy_raw:
-        parts = proxy_raw.split("@")
-        user_pass = parts[0]
-        host_port = parts[1]
-        username, password = user_pass.split(":")
-        host, port = host_port.rsplit(":", 1)
-        proxy_conf = {
-            "server": f"http://{host}:{port}",
-            "username": username,
-            "password": password,
-        }
-        label = f"proxy {host}:{port}"
-    else:
-        label = "direct"
-
-    logger.info("Refreshing wbaas token (%s)...", label)
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx_kwargs = {"user_agent": WB_BROWSER_USER_AGENT}
-        if proxy_conf:
-            ctx_kwargs["proxy"] = proxy_conf
-        ctx = browser.new_context(**ctx_kwargs)
-        ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        page = ctx.new_page()
-        page.goto("https://www.wildberries.ru/", timeout=30000)
-        page.wait_for_timeout(12000)
-        cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-        browser.close()
-
-    token_key = proxy_raw or "__direct__"
-    token = cookies.get("x_wbaas_token", "")
-    if token:
-        _token_cache[token_key] = {"token": token, "updated_at": time.time()}
-        _save_token_cache()
-        logger.info("wbaas token refreshed OK (%s, %d chars)", label, len(token))
-    else:
-        logger.error("Failed to get wbaas token (%s)", label)
-
-    return token
-
-
-def refresh_wbaas_tokens():
-    """Refresh wbaas tokens and load auth session. Call before asyncio loop."""
-    _load_token_cache()
-    _load_wb_session()
-
-    if config.WB_PROXIES:
-        # Proxy mode: token per proxy
-        for proxy_raw in config.WB_PROXIES:
-            existing = _get_wbaas_token(proxy_raw)
-            if existing:
-                logger.info("wbaas token still valid for proxy %s", proxy_raw.split("@")[1])
-                continue
-            try:
-                _refresh_wbaas_token(proxy_raw)
-            except Exception as e:
-                logger.error("Failed to refresh wbaas for %s: %s", proxy_raw.split("@")[1], e)
-    else:
-        # Direct mode: one token
-        existing = _get_wbaas_token("__direct__")
-        if existing:
-            logger.info("wbaas token still valid (direct)")
-            return
-        try:
-            _refresh_wbaas_token()
-        except Exception as e:
-            logger.error("Failed to refresh wbaas (direct): %s", e)
 
 
 # ── Search API ──
@@ -516,7 +427,6 @@ async def get_positions(article: int, keywords: list[str],
     # Direct mode (no proxies) or proxy mode
     proxy_raw = config.WB_PROXIES[0] if config.WB_PROXIES else ""
     mode = "proxy" if proxy_raw else "direct"
-    token_key = proxy_raw or "__direct__"
 
     logger.info("Fetching positions for %d: %d keywords (%s)", article, len(keywords), mode)
 
@@ -527,40 +437,21 @@ async def get_positions(article: int, keywords: list[str],
     session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE) if not proxy_raw else None
 
     for kw in keywords:
-
-        if not _get_wbaas_token(token_key):
-            logger.warning("No wbaas token, refreshing...")
-            try:
-                await asyncio.to_thread(_refresh_wbaas_token, proxy_raw or None)
-            except Exception as e:
-                logger.error("wbaas refresh failed: %s", e)
-
         item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
 
-        # Retry once if error (empty page, HTTP error)
+        # Retry only a transient/incomplete response.  Classified WB rejections
+        # stop immediately so the bot never turns one failure into a burst.
         if item.get("error"):
             error_state = item.get("error_state")
-            if not error_state:
-                logger.warning("Retry '%s' for %d (incomplete response)", kw, article)
+            if not error_state or error_state == "network_error":
+                logger.warning("Retry '%s' for %d (transient response)", kw, article)
                 await asyncio.sleep(0.5)
                 item = await asyncio.to_thread(
                     _fetch_keyword_sync, proxy_raw, kw, article, dest, session
                 )
                 error_state = item.get("error_state")
 
-            status_code = item.get("status_code")
-            error_message = item.get("error_message") or "WB returned incomplete search data"
-            if error_state == "antibot":
-                record_antibot(status_code, error_message, "position_parser")
-                blocked_error = item
-            elif error_state == "rate_limited":
-                record_rate_limit(status_code, error_message, "position_parser")
-                blocked_error = item
-            elif error_state == "auth_expired":
-                record_auth_expired(status_code, error_message, "position_parser")
-                blocked_error = item
-            elif error_state == "network_error":
-                record_network_error(status_code, error_message, "position_parser")
+            if item.get("error"):
                 blocked_error = item
 
         result[kw] = {

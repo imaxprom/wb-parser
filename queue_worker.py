@@ -1,11 +1,6 @@
 """
 Global position-checking queue with fair round-robin scheduling.
-Ensures concurrent requests from multiple users don't cause WB rate limits.
-
-Based on rate limit tests (2026-04-02):
-- Burst up to 50 requests: OK
-- Between articles: 3 sec pause needed
-- On 429: retry after 5s (handled by chrome_positions)
+Only one article is checked at a time, with a short pause between articles.
 """
 
 import asyncio
@@ -15,7 +10,6 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 import config
-from wb_health import get_access_health, probe_delay_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +21,7 @@ else:
     import chrome_positions as _positions_module
     logger.info("Queue worker using CHROME mode")
 
-PAUSE_BETWEEN_TASKS = 3.0  # seconds between chrome_positions calls
+PAUSE_BETWEEN_TASKS = 3.0  # seconds between article checks
 
 
 @dataclass
@@ -41,10 +35,10 @@ class Task:
 
 
 class PositionQueue:
-    """Fair round-robin queue for Chrome position checks.
+    """Fair round-robin queue for position checks.
 
     - Tasks from different users are interleaved (round-robin)
-    - Rate limit: minimum PAUSE_BETWEEN_TASKS between Chrome calls
+    - Rate limit: minimum PAUSE_BETWEEN_TASKS between article checks
     - Thread-safe via asyncio.Lock
     """
 
@@ -166,33 +160,9 @@ class PositionQueue:
                 task.uid, task.label, len(task.keywords), self.pending_count
             )
             try:
-                access = get_access_health()
-                retry_delay = probe_delay_seconds(access)
-                if retry_delay > 0:
-                    logger.warning(
-                        "Task %s skipped: WB access state=%s, retry in %d seconds",
-                        task.label,
-                        access.get("state"),
-                        retry_delay,
-                    )
-                    result = {
-                        keyword: {
-                            "promo_pos": None,
-                            "organic_pos": None,
-                            "is_advertised": False,
-                            "preset_id": None,
-                            "tokens": [],
-                            "error": True,
-                            "error_state": access.get("state"),
-                            "status_code": access.get("last_status"),
-                            "error_message": access.get("last_error") or "WB access cooldown",
-                        }
-                        for keyword in task.keywords
-                    }
-                else:
-                    result = await _positions_module.get_positions(
-                        task.nm_id, task.keywords
-                    )
+                result = await _positions_module.get_positions(
+                    task.nm_id, task.keywords
+                )
                 if not task.future.cancelled():
                     task.future.set_result(result)
                 logger.info("Done: %s (%.1fs since submit)",
