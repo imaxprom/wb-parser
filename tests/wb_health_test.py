@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import ReplyKeyboardMarkup
 
 import wb_health
 import bot
@@ -208,35 +208,34 @@ class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):
             for button in row
         ]
         self.assertIn("evirma_10", callback_data)
-        self.assertIn("menu_main", callback_data)
+        self.assertNotIn("menu_main", callback_data)
 
-    async def test_main_menu_uses_inline_callback_navigation(self):
+    async def test_main_menu_stays_persistent_above_the_input(self):
         keyboard = bot.main_kb()
 
-        self.assertIsInstance(keyboard, InlineKeyboardMarkup)
-        callback_data = [
-            button.callback_data
-            for row in keyboard.inline_keyboard
+        self.assertIsInstance(keyboard, ReplyKeyboardMarkup)
+        button_texts = [
+            button.text
+            for row in keyboard.keyboard
             for button in row
         ]
         self.assertEqual(
-            callback_data,
+            button_texts,
             [
-                "menu_search", "menu_shelves", "menu_auto", "menu_charts",
-                "menu_geo", "menu_settings",
+                "Поиск", "Полки", "Авто", "📈 Графики",
+                "🌍 Гео-сканер", "⚙️ Настройки",
             ],
         )
 
-    async def test_legacy_keyboard_migration_sends_a_fresh_inline_message(self):
-        cleanup = SimpleNamespace(delete=AsyncMock())
+    async def test_section_screen_is_sent_without_removing_the_main_keyboard(self):
         screen = SimpleNamespace()
-        message = SimpleNamespace(answer=AsyncMock(side_effect=(cleanup, screen)))
+        message = SimpleNamespace(answer=AsyncMock(return_value=screen))
+        section_keyboard = bot.InlineKeyboardMarkup(inline_keyboard=[])
 
-        result = await bot.answer_inline_screen(message, bot.MAIN_MENU_TEXT, bot.main_kb())
+        result = await bot.answer_inline_screen(message, "Поиск", section_keyboard)
 
         self.assertIs(result, screen)
-        self.assertEqual(message.answer.await_count, 2)
-        cleanup.delete.assert_awaited_once_with()
+        message.answer.assert_awaited_once()
 
     async def test_empty_scheduler_does_not_contact_wb(self):
         submit = AsyncMock()

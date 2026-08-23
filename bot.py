@@ -16,7 +16,7 @@ from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.types import (
     Message, CallbackQuery, FSInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove,
+    ReplyKeyboardMarkup, KeyboardButton,
     TelegramObject, CopyTextButton,
 )
 from aiogram.filters import Command, StateFilter
@@ -147,45 +147,37 @@ MAIN_MENU_TEXT = (
 )
 
 
-def main_kb() -> InlineKeyboardMarkup:
-    """Main navigation attached to the bot message instead of Telegram's input bar."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Поиск", callback_data="menu_search"),
-         InlineKeyboardButton(text="🏪 Полки", callback_data="menu_shelves")],
-        [InlineKeyboardButton(text="🔄 Авто", callback_data="menu_auto"),
-         InlineKeyboardButton(text="📈 Графики", callback_data="menu_charts")],
-        [InlineKeyboardButton(text="🌍 Гео-сканер", callback_data="menu_geo")],
-        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu_settings")],
-    ])
+def main_kb() -> ReplyKeyboardMarkup:
+    """Persistent main navigation above Telegram's input field."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Поиск"), KeyboardButton(text="Полки"), KeyboardButton(text="Авто")],
+            [KeyboardButton(text="📈 Графики"), KeyboardButton(text="🌍 Гео-сканер")],
+            [KeyboardButton(text="⚙️ Настройки")],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def section_nav_kb(section_callback: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data=section_callback),
-         InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data=section_callback)],
     ])
 
 
 async def answer_inline_screen(
     message: Message,
     text: str,
-    reply_markup: InlineKeyboardMarkup,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup,
     *,
     parse_mode: str | None = "HTML",
 ):
-    """Migrate users from the old persistent reply keyboard to one inline screen."""
-    cleanup = await message.answer("Обновляю меню…", reply_markup=ReplyKeyboardRemove())
-    try:
-        return await message.answer(
-            text,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup,
-        )
-    finally:
-        try:
-            await cleanup.delete()
-        except Exception:
-            pass
+    """Send a section screen while keeping the persistent main keyboard visible."""
+    return await message.answer(
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
 
 
 
@@ -762,7 +754,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def show_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
-    await callback.message.edit_text(
+    await callback.message.answer(
         MAIN_MENU_TEXT,
         parse_mode="HTML",
         reply_markup=main_kb(),
@@ -1260,7 +1252,6 @@ def _build_search_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         text = "🔍 <b>Поиск</b>\n\nВыбери артикул для проверки:"
     else:
         text = "🔍 <b>Поиск</b>\n\nНет артикулов для проверки."
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1852,7 +1843,6 @@ def _auto_buttons(uid, arts):
             callback_data=f"auto_toggle_{a['id']}",
         )])
     buttons.append([InlineKeyboardButton(text="⏱ Интервал", callback_data="set_interval")])
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
     return buttons
 
 
@@ -1883,7 +1873,6 @@ def _build_charts_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         buttons.append([InlineKeyboardButton(
             text=f"📈 {label}", callback_data=f"chart_{a['id']}"
         )])
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
     text = "📈 <b>Графики</b>\n\nВыбери артикул:" if arts else "📈 <b>Графики</b>\n\nНет артикулов."
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1949,9 +1938,6 @@ def _build_settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")
         ])
-    kb.inline_keyboard.append([
-        InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")
-    ])
     return "⚙️ <b>Настройки</b>\n\nВыбери раздел:", kb
 
 
@@ -2395,7 +2381,6 @@ def _build_geo_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     for a in arts:
         label = f"{a['sku']} — {a['name']}" if a.get("name") else a["sku"]
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"geo_{a['id']}")])
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2520,7 +2505,6 @@ def _build_shelf_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
         text = "🏪 <b>Полки</b>\n\nВыбери артикул для проверки:"
     else:
         text = "🏪 <b>Полки</b>\n\nНет артикулов."
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
