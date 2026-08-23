@@ -174,9 +174,18 @@ async def answer_inline_screen(
     parse_mode: str | None = "HTML",
 ):
     """Migrate users from the old persistent reply keyboard to one inline screen."""
-    screen = await message.answer("Открываю меню…", reply_markup=ReplyKeyboardRemove())
-    await screen.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    return screen
+    cleanup = await message.answer("Обновляю меню…", reply_markup=ReplyKeyboardRemove())
+    try:
+        return await message.answer(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    finally:
+        try:
+            await cleanup.delete()
+        except Exception:
+            pass
 
 
 

@@ -227,6 +227,17 @@ class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_legacy_keyboard_migration_sends_a_fresh_inline_message(self):
+        cleanup = SimpleNamespace(delete=AsyncMock())
+        screen = SimpleNamespace()
+        message = SimpleNamespace(answer=AsyncMock(side_effect=(cleanup, screen)))
+
+        result = await bot.answer_inline_screen(message, bot.MAIN_MENU_TEXT, bot.main_kb())
+
+        self.assertIs(result, screen)
+        self.assertEqual(message.answer.await_count, 2)
+        cleanup.delete.assert_awaited_once_with()
+
     async def test_empty_scheduler_does_not_contact_wb(self):
         submit = AsyncMock()
         verification = Mock()
