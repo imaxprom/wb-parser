@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from aiogram.types import InlineKeyboardMarkup
+
 import wb_health
 import bot
 import proxy_positions
@@ -181,6 +183,49 @@ class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):
         callback.answer.assert_awaited_once_with()
         callback.message.edit_text.assert_awaited_once()
         verification.assert_not_called()
+
+    async def test_search_menu_edits_the_existing_bot_message(self):
+        callback = SimpleNamespace(
+            from_user=SimpleNamespace(id=1),
+            answer=AsyncMock(),
+            message=SimpleNamespace(edit_text=AsyncMock()),
+        )
+        state = SimpleNamespace(clear=AsyncMock())
+        articles = [{"id": 10, "sku": "123", "name": "Товар"}]
+        with (
+            patch.object(bot.db, "get_articles", return_value=articles),
+            patch.object(bot.db, "get_queries", return_value=[{"id": 20, "query": "запрос"}]),
+        ):
+            await bot.show_search_menu(callback, state)
+
+        state.clear.assert_awaited_once_with()
+        callback.answer.assert_awaited_once_with()
+        callback.message.edit_text.assert_awaited_once()
+        _, kwargs = callback.message.edit_text.await_args
+        callback_data = [
+            button.callback_data
+            for row in kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("evirma_10", callback_data)
+        self.assertIn("menu_main", callback_data)
+
+    async def test_main_menu_uses_inline_callback_navigation(self):
+        keyboard = bot.main_kb()
+
+        self.assertIsInstance(keyboard, InlineKeyboardMarkup)
+        callback_data = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            callback_data,
+            [
+                "menu_search", "menu_shelves", "menu_auto", "menu_charts",
+                "menu_geo", "menu_settings",
+            ],
+        )
 
     async def test_empty_scheduler_does_not_contact_wb(self):
         submit = AsyncMock()

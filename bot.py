@@ -16,7 +16,7 @@ from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.types import (
     Message, CallbackQuery, FSInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardRemove,
     TelegramObject, CopyTextButton,
 )
 from aiogram.filters import Command, StateFilter
@@ -141,15 +141,42 @@ MENU_TEXTS = frozenset({
 
 # --- Keyboards ---
 
-def main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Поиск"), KeyboardButton(text="Полки"), KeyboardButton(text="Авто")],
-            [KeyboardButton(text="📈 Графики"), KeyboardButton(text="🌍 Гео-сканер")],
-            [KeyboardButton(text="⚙️ Настройки")],
-        ],
-        resize_keyboard=True,
-    )
+MAIN_MENU_TEXT = (
+    "📦 <b>WB Position Parser</b>\n\n"
+    "Выбери нужный раздел:"
+)
+
+
+def main_kb() -> InlineKeyboardMarkup:
+    """Main navigation attached to the bot message instead of Telegram's input bar."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="menu_search"),
+         InlineKeyboardButton(text="🏪 Полки", callback_data="menu_shelves")],
+        [InlineKeyboardButton(text="🔄 Авто", callback_data="menu_auto"),
+         InlineKeyboardButton(text="📈 Графики", callback_data="menu_charts")],
+        [InlineKeyboardButton(text="🌍 Гео-сканер", callback_data="menu_geo")],
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu_settings")],
+    ])
+
+
+def section_nav_kb(section_callback: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data=section_callback),
+         InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")],
+    ])
+
+
+async def answer_inline_screen(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+    *,
+    parse_mode: str | None = "HTML",
+):
+    """Migrate users from the old persistent reply keyboard to one inline screen."""
+    screen = await message.answer("Открываю меню…", reply_markup=ReplyKeyboardRemove())
+    await screen.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    return screen
 
 
 
@@ -718,14 +745,16 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    uid = message.from_user.id
     await state.clear()
-    await message.answer(
-        "📦 <b>WB Position Parser</b>\n\n"
-        "Отслеживаю позиции товаров в поиске Wildberries.\n\n"
-        "• Отправь <b>артикул</b> (число) чтобы добавить\n"
-        "• Загрузи <b>.xlsx</b> файл с артикулами и запросами\n"
-        "• Используй кнопки для управления",
+    await answer_inline_screen(message, MAIN_MENU_TEXT, main_kb())
+
+
+@router.callback_query(F.data == "menu_main")
+async def show_main_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    await callback.message.edit_text(
+        MAIN_MENU_TEXT,
         parse_mode="HTML",
         reply_markup=main_kb(),
     )
@@ -1207,31 +1236,40 @@ async def handle_document(message: Message):
 
 # --- Parsing ---
 
+def _build_search_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    arts = db.get_articles(uid)
+    buttons = []
+    for a in arts:
+        qcount = len(db.get_queries(uid, a["id"]))
+        label = f"{a['sku']} — {a['name']}" if a.get("name") else a["sku"]
+        buttons.append([InlineKeyboardButton(
+            text=f"🔍 {label} ({qcount} запр.)",
+            callback_data=f"evirma_{a['id']}",
+        )])
+    if arts:
+        buttons.append([InlineKeyboardButton(text="🔍 Проверить ВСЕ", callback_data="evirma_all")])
+        text = "🔍 <b>Поиск</b>\n\nВыбери артикул для проверки:"
+    else:
+        text = "🔍 <b>Поиск</b>\n\nНет артикулов для проверки."
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "menu_search")
+async def show_search_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text, kb = _build_search_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(F.text == "Поиск")
 async def parse_menu(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     try:
-        await message.delete()
-    except Exception:
-        pass
-
-    try:
-        arts = db.get_articles(uid)
-        if not arts:
-            await message.answer("Нет артикулов для проверки.", reply_markup=main_kb())
-            return
-
-        buttons = []
-        for a in arts:
-            qcount = len(db.get_queries(uid, a["id"]))
-            buttons.append([InlineKeyboardButton(
-                text=f"🔍 {a['sku'] + ' — ' + a['name'] if a.get('name') else a['sku']} ({qcount} запр.)",
-                callback_data=f"evirma_{a['id']}",
-            )])
-        buttons.append([InlineKeyboardButton(text="🔍 Проверить ВСЕ", callback_data="evirma_all")])
-
-        await message.answer("Выбери артикул для проверки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        text, kb = _build_search_view(uid)
+        await answer_inline_screen(message, text, kb)
     except Exception as e:
         logger.error(f"parse_menu error: {e}")
         await message.answer("⚠️ Ошибка. Попробуй ещё раз.", reply_markup=main_kb())
@@ -1257,12 +1295,18 @@ async def run_parse_handler(callback: CallbackQuery):
             art_id = int(target)
             article = db.get_article_by_id(uid, art_id)
             if not article:
-                await callback.message.edit_text("Артикул не найден.")
+                await callback.message.edit_text(
+                    "Артикул не найден.", reply_markup=section_nav_kb("menu_search")
+                )
                 return
             sku = article["sku"]
             queries = db.get_queries(uid, article["id"])
             if not queries:
-                await callback.message.edit_text(f"У артикула {escape(sku)} нет запросов.", parse_mode="HTML")
+                await callback.message.edit_text(
+                    f"У артикула {escape(sku)} нет запросов.",
+                    parse_mode="HTML",
+                    reply_markup=section_nav_kb("menu_search"),
+                )
                 return
 
             pages = int(db.get_setting(uid, "pages_depth") or 3)
@@ -1290,7 +1334,13 @@ async def _do_parse_one(uid: int, chat_id: int, msg_id: int, article: dict, quer
         elapsed = time.time() - start
         art_name = article.get("name") or ""
         text = format_results(sku, results, elapsed, name=art_name)
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=msg_id,
+            parse_mode="HTML",
+            reply_markup=section_nav_kb("menu_search"),
+        )
 
         alert_msgs = alerts.check_alerts(uid, article["id"], sku, results)
         for msg in alert_msgs:
@@ -1298,7 +1348,12 @@ async def _do_parse_one(uid: int, chat_id: int, msg_id: int, article: dict, quer
     except Exception as e:
         logger.error(f"Parse error: {e}")
         try:
-            await bot.edit_message_text(f"Ошибка: {e}", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"Ошибка: {e}",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_search"),
+            )
         except Exception:
             pass
 
@@ -1435,12 +1490,18 @@ async def run_evirma_handler(callback: CallbackQuery):
             art_id = int(target)
             article = db.get_article_by_id(uid, art_id)
             if not article:
-                await callback.message.edit_text("Артикул не найден.")
+                await callback.message.edit_text(
+                    "Артикул не найден.", reply_markup=section_nav_kb("menu_search")
+                )
                 return
             sku = article["sku"]
             queries = db.get_queries(uid, article["id"])
             if not queries:
-                await callback.message.edit_text(f"У артикула {escape(sku)} нет запросов.", parse_mode="HTML")
+                await callback.message.edit_text(
+                    f"У артикула {escape(sku)} нет запросов.",
+                    parse_mode="HTML",
+                    reply_markup=section_nav_kb("menu_search"),
+                )
                 return
 
             await callback.message.edit_text(
@@ -1453,7 +1514,9 @@ async def run_evirma_handler(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"run_evirma_handler error: {e}")
         try:
-            await callback.message.edit_text(f"⚠️ Ошибка: {e}")
+            await callback.message.edit_text(
+                f"⚠️ Ошибка: {e}", reply_markup=section_nav_kb("menu_search")
+            )
         except Exception:
             pass
 
@@ -1489,7 +1552,12 @@ async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, que
         nm_id = int(sku) if sku.isdigit() else 0
 
         if not nm_id:
-            await bot.edit_message_text(f"⚠️ SKU {sku} не числовой — evirma требует nm_id.", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"⚠️ SKU {sku} не числовой — evirma требует nm_id.",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_search"),
+            )
             return
 
         keywords = [q["query"] for q in queries]
@@ -1511,11 +1579,22 @@ async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, que
         _save_evirma_positions(uid, article, queries, positions)
 
         text = _format_evirma_results(sku, keywords, positions, elapsed, name=art_name)
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=msg_id,
+            parse_mode="HTML",
+            reply_markup=section_nav_kb("menu_search"),
+        )
     except Exception as e:
         logger.error(f"Evirma parse error: {e}")
         try:
-            await bot.edit_message_text(f"Ошибка: {e}", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"Ошибка: {e}",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_search"),
+            )
         except Exception:
             pass
 
@@ -1541,7 +1620,10 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
             task_infos.append((article, queries, keywords))
 
         if not task_infos:
-            await bot.edit_message_text("Нет данных.", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                "Нет данных.", chat_id=chat_id, message_id=msg_id,
+                reply_markup=section_nav_kb("menu_search"),
+            )
             return
 
         total = len(task_infos)
@@ -1586,7 +1668,10 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
         now = datetime.now().strftime("%H:%M %d.%m")
 
         if not all_blocks:
-            await bot.edit_message_text("Нет данных.", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                "Нет данных.", chat_id=chat_id, message_id=msg_id,
+                reply_markup=section_nav_kb("menu_search"),
+            )
             return
 
         separator = ["────────────────────────────┴──────┴──────┘"]
@@ -1604,18 +1689,35 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
             for i, block in enumerate(all_blocks):
                 block_text = f"<pre>{chr(10).join(block)}</pre>"
                 if i == 0:
-                    await bot.edit_message_text(block_text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+                    await bot.edit_message_text(
+                        block_text,
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        parse_mode="HTML",
+                        reply_markup=section_nav_kb("menu_search"),
+                    )
                 else:
                     await bot.send_message(chat_id, block_text, parse_mode="HTML")
             error_notice = _evirma_error_notice(all_position_sets)
             if error_notice:
                 await bot.send_message(chat_id, error_notice.lstrip(), parse_mode="HTML")
         else:
-            await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+            await bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                parse_mode="HTML",
+                reply_markup=section_nav_kb("menu_search"),
+            )
     except Exception as e:
         logger.error(f"Evirma all error: {e}")
         try:
-            await bot.edit_message_text(f"Ошибка: {e}", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"Ошибка: {e}",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_search"),
+            )
         except Exception:
             pass
 
@@ -1697,30 +1799,35 @@ def _format_evirma_results(sku: str, keywords: list[str], positions: dict, elaps
 
 # --- Auto Check ---
 
+def _build_auto_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    arts = db.get_articles(uid)
+    interval = db.get_setting(uid, "interval_minutes")
+    auto_arts = [a for a in arts if a.get("auto_check")]
+    text = (
+        "🔄 <b>Автопроверка</b>\n\n"
+        f"⏱ Интервал: <b>{interval} мин</b>\n"
+        f"📦 В авто: <b>{len(auto_arts)}</b> из {len(arts)}\n"
+    )
+    if not arts:
+        text += "\nНет артикулов."
+    return text, InlineKeyboardMarkup(inline_keyboard=_auto_buttons(uid, arts))
+
+
+@router.callback_query(F.data == "menu_auto")
+async def show_auto_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text, kb = _build_auto_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(F.text == "Авто")
 async def auto_menu(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     try:
-        await message.delete()
-    except Exception:
-        pass
-
-    try:
-        arts = db.get_articles(uid)
-        if not arts:
-            await message.answer("Нет артикулов.", reply_markup=main_kb())
-            return
-
-        interval = db.get_setting(uid, "interval_minutes")
-        auto_arts = [a for a in arts if a.get("auto_check")]
-
-        text = f"🔄 <b>Автопроверка</b>\n\n"
-        text += f"⏱ Интервал: <b>{interval} мин</b>\n"
-        text += f"📦 В авто: <b>{len(auto_arts)}</b> из {len(arts)}\n"
-
-        buttons = _auto_buttons(uid, arts)
-        await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        text, kb = _build_auto_view(uid)
+        await answer_inline_screen(message, text, kb)
     except Exception as e:
         logger.error(f"auto_menu error: {e}")
         await message.answer("⚠️ Ошибка. Попробуй ещё раз.", reply_markup=main_kb())
@@ -1736,6 +1843,7 @@ def _auto_buttons(uid, arts):
             callback_data=f"auto_toggle_{a['id']}",
         )])
     buttons.append([InlineKeyboardButton(text="⏱ Интервал", callback_data="set_interval")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
     return buttons
 
 
@@ -1749,12 +1857,8 @@ async def auto_toggle(callback: CallbackQuery):
         sku = article["sku"] if article else "?"
         await callback.answer(f"{sku}: {'включён' if new_state else 'выключен'}")
 
-        arts = db.get_articles(uid)
-        interval = db.get_setting(uid, "interval_minutes")
-        auto_arts = [a for a in arts if a.get("auto_check")]
-        text = f"🔄 <b>Автопроверка</b>\n\n⏱ Интервал: <b>{interval} мин</b>\n📦 В авто: <b>{len(auto_arts)}</b> из {len(arts)}\n"
-        buttons = _auto_buttons(uid, arts)
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        text, kb = _build_auto_view(uid)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error(f"auto_toggle error: {e}")
         await callback.answer(f"Ошибка: {e}", show_alert=True)
@@ -1762,26 +1866,34 @@ async def auto_toggle(callback: CallbackQuery):
 
 # --- Charts ---
 
+def _build_charts_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    arts = db.get_articles(uid)
+    buttons = []
+    for a in arts:
+        label = f"{a['sku']} — {a['name']}" if a.get("name") else a["sku"]
+        buttons.append([InlineKeyboardButton(
+            text=f"📈 {label}", callback_data=f"chart_{a['id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
+    text = "📈 <b>Графики</b>\n\nВыбери артикул:" if arts else "📈 <b>Графики</b>\n\nНет артикулов."
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "menu_charts")
+async def show_charts_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text, kb = _build_charts_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(F.text == "📈 Графики")
 async def charts_menu(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     try:
-        await message.delete()
-    except Exception:
-        pass
-    try:
-        arts = db.get_articles(uid)
-        if not arts:
-            await message.answer("Нет артикулов.", reply_markup=main_kb())
-            return
-        buttons = []
-        for a in arts:
-            buttons.append([InlineKeyboardButton(
-                text=f"📈 {a['sku'] + ' — ' + a['name'] if a.get('name') else a['sku']}",
-                callback_data=f"chart_{a['id']}",
-            )])
-        await message.answer("Выбери артикул:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        text, kb = _build_charts_view(uid)
+        await answer_inline_screen(message, text, kb)
     except Exception as e:
         logger.error(f"charts_menu error: {e}")
         await message.answer("⚠️ Ошибка. Попробуй ещё раз.", reply_markup=main_kb())
@@ -1815,31 +1927,40 @@ async def show_chart(callback: CallbackQuery):
 
 # --- Settings ---
 
+def _build_settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Поиск", callback_data="settings_search"),
+         InlineKeyboardButton(text="🏪 Полки", callback_data="settings_shelves")],
+        [InlineKeyboardButton(text="🔔 Уведомления", callback_data="go_alerts")],
+    ])
+    if db.is_owner(uid):
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")
+        ])
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")
+        ])
+    kb.inline_keyboard.append([
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")
+    ])
+    return "⚙️ <b>Настройки</b>\n\nВыбери раздел:", kb
+
+
+@router.callback_query(F.data == "menu_settings")
+async def show_settings_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text, kb = _build_settings_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(F.text == "⚙️ Настройки")
 async def show_settings(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
     try:
-        await message.delete()
-    except Exception:
-        pass
-    try:
-        interval = db.get_setting(uid, "interval_minutes")
-        depth = db.get_setting(uid, "pages_depth")
-
-        text = (
-            "⚙️ <b>Настройки</b>\n\n"
-        )
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Поиск", callback_data="settings_search"),
-             InlineKeyboardButton(text="🏪 Полки", callback_data="settings_shelves")],
-            [InlineKeyboardButton(text="🔔 Уведомления", callback_data="go_alerts")],
-        ])
-        if db.is_owner(uid):
-            kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")])
-            kb.inline_keyboard.append([InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")])
-        await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        text, kb = _build_settings_view(uid)
+        await answer_inline_screen(message, text, kb)
     except Exception as e:
         logger.error(f"show_settings error: {e}")
         await message.answer("⚠️ Ошибка. Попробуй ещё раз.", reply_markup=main_kb())
@@ -1923,15 +2044,7 @@ async def go_settings(callback: CallbackQuery):
     """Return to main settings menu."""
     uid = callback.from_user.id
     await callback.answer()
-    text = "⚙️ <b>Настройки</b>\n\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Поиск", callback_data="settings_search"),
-         InlineKeyboardButton(text="🏪 Полки", callback_data="settings_shelves")],
-        [InlineKeyboardButton(text="🔔 Уведомления", callback_data="go_alerts")],
-    ])
-    if db.is_owner(uid):
-        kb.inline_keyboard.append([InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")])
-        kb.inline_keyboard.append([InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")])
+    text, kb = _build_settings_view(uid)
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -2007,6 +2120,7 @@ def _build_alerts_view(uid):
             InlineKeyboardButton(text=f"{toggle_icon} {short}", callback_data=f"alert_toggle_{a['alert_type']}"),
             InlineKeyboardButton(text="⚙️ Порог", callback_data=f"alert_thresh_{a['alert_type']}"),
         ])
+    buttons.append([InlineKeyboardButton(text="⬅️ Настройки", callback_data="go_settings")])
     return text, buttons
 
 
@@ -2259,34 +2373,37 @@ async def set_threshold_start(callback: CallbackQuery, state: FSMContext):
 
 # --- Geo Scanner ---
 
+def _build_geo_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    arts = db.get_articles(uid)
+    regions = config.GEO_REGIONS
+    text = "🌍 <b>Гео-сканер</b>\n\n<b>Регионы сканирования:</b>\n"
+    for region in regions:
+        text += f"<b>{region['short']}</b> — {region['name']}\n"
+    text += "\n<i>ПВЗ для сканирования находится в центре города</i>"
+    text += "\n\nВыбери артикул:" if arts else "\n\nНет артикулов."
+
+    buttons = []
+    for a in arts:
+        label = f"{a['sku']} — {a['name']}" if a.get("name") else a["sku"]
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"geo_{a['id']}")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "menu_geo")
+async def show_geo_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text, kb = _build_geo_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(F.text == "🌍 Гео-сканер")
 async def show_geo_scanner(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    arts = db.get_articles(uid)
-    if not arts:
-        await message.answer("Нет артикулов. Добавь в ⚙️ Настройки → Артикулы.", reply_markup=main_kb())
-        return
-
-    regions = config.GEO_REGIONS
-    legend = "🌍 <b>Гео-сканер</b>\n\n<b>Регионы сканирования:</b>\n"
-    for r in regions:
-        legend += f"<b>{r['short']}</b> — {r['name']}\n"
-    legend += "\n<i>ПВЗ для сканирования находится в центре города</i>\n\nВыбери артикул:"
-
-    buttons = []
-    for a in arts:
-        name = a.get("name") or ""
-        label = f"{a['sku']} — {name}" if name else a['sku']
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"geo_{a['id']}")])
-
-    await message.answer(legend, parse_mode="HTML",
-                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    text, kb = _build_geo_view(uid)
+    await answer_inline_screen(message, text, kb)
 
 
 @router.callback_query(F.data.startswith("geo_"))
@@ -2342,7 +2459,9 @@ async def geo_scan_start(callback: CallbackQuery):
 
     # Split if too long
     if len(text) <= 4096:
-        await msg.edit_text(text, parse_mode="HTML")
+        await msg.edit_text(
+            text, parse_mode="HTML", reply_markup=section_nav_kb("menu_geo")
+        )
     else:
         # Split by queries
         half = len(queries) // 2
@@ -2362,7 +2481,11 @@ async def geo_scan_start(callback: CallbackQuery):
             part_table = "\n".join(part_lines)
             part_text = f"🌍 <b>{header}</b> ({part_idx + 1}/2)\n\n<pre>{part_table}</pre>"
             if part_idx == 0:
-                await msg.edit_text(part_text, parse_mode="HTML")
+                await msg.edit_text(
+                    part_text,
+                    parse_mode="HTML",
+                    reply_markup=section_nav_kb("menu_geo"),
+                )
             else:
                 await bot.send_message(callback.from_user.id, part_text, parse_mode="HTML")
 
@@ -2371,36 +2494,41 @@ async def geo_scan_start(callback: CallbackQuery):
 
 # -- Main menu "Полки" button: select article → instant scan --
 
+def _build_shelf_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    arts = db.get_articles(uid)
+    buttons = []
+    for a in arts:
+        comp_count = db.count_competitors(uid, a["id"])
+        label = a["sku"]
+        if a.get("name"):
+            label += f" — {a['name']}"
+        label += f" ({comp_count} конк.)"
+        buttons.append([InlineKeyboardButton(
+            text=label, callback_data=f"shelf_check_{a['id']}"
+        )])
+    if arts:
+        buttons.append([InlineKeyboardButton(text="▶️ Проверить ВСЕ", callback_data="shelf_check_all")])
+        text = "🏪 <b>Полки</b>\n\nВыбери артикул для проверки:"
+    else:
+        text = "🏪 <b>Полки</b>\n\nНет артикулов."
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(F.data == "menu_shelves")
+async def show_shelf_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer()
+    text, kb = _build_shelf_view(callback.from_user.id)
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
 @router.message(F.text == "Полки")
 async def shelf_menu(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    arts = db.get_articles(uid)
-    if not arts:
-        await message.answer("Нет артикулов. Добавь в ⚙️ Настройки.", reply_markup=main_kb())
-        return
-
-    buttons = []
-    for a in arts:
-        comp_count = db.count_competitors(uid, a["id"])
-        name = a.get("name") or ""
-        label = f"{a['sku']}"
-        if name:
-            label += f" — {name}"
-        label += f" ({comp_count} конк.)"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"shelf_check_{a['id']}")])
-    buttons.append([InlineKeyboardButton(text="▶️ Проверить ВСЕ", callback_data="shelf_check_all")])
-
-    await message.answer(
-        "🏪 <b>Полки</b>\n\nВыбери артикул для проверки:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    text, kb = _build_shelf_view(uid)
+    await answer_inline_screen(message, text, kb)
 
 
 # -- Settings "Полки": shelf_{id} shows competitor management --
@@ -2649,11 +2777,22 @@ async def _do_shelf_check(uid: int, chat_id: int, msg_id: int, article: dict, co
         elapsed = time.time() - start
 
         text = _format_shelf_results(sku, competitors, results, elapsed, name=art_name)
-        await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=msg_id,
+            parse_mode="HTML",
+            reply_markup=section_nav_kb("menu_shelves"),
+        )
     except Exception as e:
         logger.error(f"Shelf check error: {e}")
         try:
-            await bot.edit_message_text(f"Ошибка: {e}", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"Ошибка: {e}",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_shelves"),
+            )
         except Exception:
             pass
 
@@ -2686,15 +2825,31 @@ async def _do_shelf_check_all(uid: int, chat_id: int, msg_id: int, arts_with_com
         full_text = f"{now}{_elapsed_str(elapsed)}\n\n" + "\n\n".join(all_texts)
 
         if len(full_text) <= 4000:
-            await bot.edit_message_text(full_text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+            await bot.edit_message_text(
+                full_text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                parse_mode="HTML",
+                reply_markup=section_nav_kb("menu_shelves"),
+            )
         else:
-            await bot.edit_message_text(f"{now}{_elapsed_str(elapsed)}", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"{now}{_elapsed_str(elapsed)}",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_shelves"),
+            )
             for block in all_texts:
                 await bot.send_message(chat_id, block, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Shelf check all error: {e}")
         try:
-            await bot.edit_message_text(f"Ошибка: {e}", chat_id=chat_id, message_id=msg_id)
+            await bot.edit_message_text(
+                f"Ошибка: {e}",
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=section_nav_kb("menu_shelves"),
+            )
         except Exception:
             pass
 
