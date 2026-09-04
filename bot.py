@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -418,207 +419,263 @@ def _wb_context_has_auth_tokens(ctx, page) -> tuple[bool, dict]:
     return bool(checks["bearer"] and checks["pow"] and checks["wbaas"]), checks
 
 
+def _start_wb_virtual_display() -> tuple[subprocess.Popen | None, str | None]:
+    """Start a private Xvfb display so Playwright can use non-headless Chromium."""
+    base_display = 200 + (os.getpid() % 1000)
+    for display_number in range(base_display, base_display + 20):
+        process = subprocess.Popen(
+            [
+                "Xvfb",
+                f":{display_number}",
+                "-screen", "0", "1920x1080x24",
+                "-nolisten", "tcp",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.2)
+        if process.poll() is None:
+            return process, f":{display_number}"
+    return None, None
+
+
+def _stop_wb_virtual_display(process: subprocess.Popen | None):
+    if not process or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                                status_cb) -> dict:
     """Run WB buyer login in a blocking Playwright thread."""
     from playwright.sync_api import sync_playwright
 
-    status_cb("🌐 Открываю страницу входа WB...")
-    with sync_playwright() as p:
-        wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        try:
-            context_args = {
-                "user_agent": WB_BROWSER_USER_AGENT,
-                "viewport": {"width": 1920, "height": 1080},
-                "locale": "ru-RU",
-                "timezone_id": "Europe/Moscow",
-            }
-            if os.path.exists(wb_state_path):
-                context_args["storage_state"] = wb_state_path
-                status_cb("♻️ Использую сохранённый браузерный state WB.")
+    status_cb("🖥 Запускаю полноценный Chromium для входа WB...")
+    virtual_display, display = _start_wb_virtual_display()
+    if not display:
+        raise RuntimeError("Не удалось запустить виртуальный экран Xvfb для Chromium.")
 
-            ctx = browser.new_context(**context_args)
-            ctx.add_init_script(
-                'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
-            )
-            page = ctx.new_page()
-            page.goto("https://www.wildberries.ru/", timeout=30000)
-            page.wait_for_timeout(3000)
-            page.goto("https://www.wildberries.ru/security/login", timeout=30000)
-
-            status_cb("🛡 Прохожу антибот-проверку WB...")
-            phone_selector = (
-                'input[name="phoneNumber"]:not([type="radio"]), '
-                'input[data-test-id="field_phone_input"], '
-                'input#wb-phone-number'
+    ctx = None
+    try:
+        with sync_playwright() as p:
+            login_state_path = os.path.join(config.DATA_DIR, "wb_login_working_state.json")
+            launch_env = {**os.environ, "DISPLAY": display}
+            browser = p.chromium.launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                env=launch_env,
             )
             try:
-                page.wait_for_selector(
-                    phone_selector,
-                    timeout=70000,
+                context_args = {
+                    "user_agent": WB_BROWSER_USER_AGENT,
+                    "viewport": {"width": 1920, "height": 1080},
+                    "locale": "ru-RU",
+                    "timezone_id": "Europe/Moscow",
+                }
+                if os.path.exists(login_state_path):
+                    context_args["storage_state"] = login_state_path
+                    status_cb("♻️ Продолжаю с сохранённого состояния страницы входа WB.")
+
+                ctx = browser.new_context(**context_args)
+                ctx.add_init_script(
+                    'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
                 )
-            except Exception as e:
-                try:
+                page = ctx.new_page()
+                status_cb("🌐 Открываю страницу входа WB...")
+                page.goto("https://www.wildberries.ru/", timeout=30000)
+                page.wait_for_timeout(3000)
+                page.goto("https://www.wildberries.ru/security/login", timeout=30000)
+
+                status_cb("🛡 Ожидаю завершения проверки браузера WB...")
+                phone_selector = (
+                    'input[name="phoneNumber"]:not([type="radio"]), '
+                    'input[data-test-id="field_phone_input"], '
+                    'input#wb-phone-number'
+                )
+                phone_ready = False
+                wait_started = time.time()
+                last_status_at = 0.0
+                while time.time() - wait_started < 300:
+                    if job.cancel_event.is_set():
+                        raise RuntimeError("Обновление отменено.")
+                    try:
+                        if page.locator(phone_selector).first.is_visible():
+                            phone_ready = True
+                            break
+                    except Exception:
+                        pass
+                    elapsed = time.time() - wait_started
+                    if elapsed - last_status_at >= 60:
+                        status_cb(
+                            f"🛡 WB всё ещё проверяет браузер ({int(elapsed)} сек). "
+                            "Chromium остаётся открытым."
+                        )
+                        last_status_at = elapsed
+                    page.wait_for_timeout(2000)
+
+                if not phone_ready:
                     current_url = page.url
-                except Exception:
-                    current_url = ""
-                try:
                     title = page.title()
-                except Exception:
-                    title = ""
-                body = _safe_body_text(page, 1600)
-                if (
-                    "/lk" in current_url
-                    or "Профиль" in body
-                    or "Заказы" in body
-                ):
-                    status_cb(
-                        "✅ WB уже открыл личный кабинет. "
-                        "Сохраняю токены из текущего браузерного state..."
-                    )
-                    return _save_wb_session_from_context(ctx, page)
-
-                debug = _save_wb_login_debug(page, "wait_phone_input")
-                raise RuntimeError(
-                    "WB не показал поле ввода телефона. "
-                    f"URL={debug.get('url') or current_url}; title={title!r}. "
-                    f"Похоже на антибот/блокировку страницы. Debug: "
-                    f"html={debug.get('html') or '-'}, screenshot={debug.get('screenshot') or '-'}. "
-                    f"Текст страницы: {body[:500]}"
-                ) from e
-
-            if job.cancel_event.is_set():
-                raise RuntimeError("Обновление отменено.")
-
-            phone_input = page.locator(phone_selector).first
-            phone_value = phone
-            try:
-                input_id = phone_input.get_attribute("id") or ""
-                data_test_id = phone_input.get_attribute("data-test-id") or ""
-                if input_id == "wb-phone-number" or data_test_id == "field_phone_input":
-                    phone_value = phone[1:] if len(phone) == 11 and phone.startswith("7") else phone
-            except Exception:
-                pass
-            phone_input.fill(phone_value)
-            page.wait_for_timeout(800)
-
-            rendered_phone = phone_input.input_value()
-            status_cb(f"📱 Номер введён: <b>{escape(rendered_phone)}</b>")
-
-            button = _visible_button_by_text(page, "Получить")
-            if not button:
-                debug = _save_wb_login_debug(page, "no_get_code_button")
-                raise RuntimeError(
-                    "Не нашёл кнопку «Получить код» на странице WB. "
-                    f"Debug: html={debug.get('html') or '-'}, "
-                    f"screenshot={debug.get('screenshot') or '-'}."
-                )
-            button.click()
-
-            status_cb("📨 Запрашиваю код WB...")
-            code_screen = False
-            last_text = ""
-            for _ in range(90):
-                if job.cancel_event.is_set():
-                    raise RuntimeError("Обновление отменено.")
-                page.wait_for_timeout(1000)
-                last_text = _safe_body_text(page, 1600)
-                if "Некорректный формат номера" in last_text:
-                    raise RuntimeError(
-                        "WB отклонил номер как некорректный. "
-                        "Попробуй формат +7 999 123-45-67 или 79991234567."
-                    )
-                if (
-                    "Откройте уведомление" in last_text
-                    or "Вам пришло уведомление" in last_text
-                    or "Код" in last_text
-                    or page.query_selector('input[inputmode="numeric"]')
-                ):
-                    code_screen = True
-                    break
-
-            if not code_screen:
-                debug = _save_wb_login_debug(page, "no_code_screen")
-                raise RuntimeError(
-                    "WB не открыл экран ввода кода. Последний текст страницы: "
-                    + last_text[:500]
-                    + f" Debug: html={debug.get('html') or '-'}, "
-                    + f"screenshot={debug.get('screenshot') or '-'}."
-                )
-
-            status_cb(
-                "✅ WB запросил код. Открой приложение Wildberries или SMS "
-                "и отправь сюда 6 цифр."
-            )
-
-            # Wait up to 5 minutes for Telegram code input.
-            if not job.code_event.wait(timeout=300):
-                raise RuntimeError("Истёк таймаут ожидания кода WB.")
-            if job.cancel_event.is_set():
-                raise RuntimeError("Обновление отменено.")
-
-            code = job.code
-            status_cb("🔐 Ввожу код WB...")
-
-            code_inputs = page.query_selector_all('input[data-test-id="field_code_input"]')
-            if code_inputs:
-                code_inputs[0].click()
-                page.keyboard.type(code, delay=120)
-            else:
-                code_inputs = page.query_selector_all('input[inputmode="numeric"]')
-            if not code_inputs:
-                code_inputs = page.query_selector_all('input[type="tel"]')
-            if not code_inputs:
-                code_inputs = page.query_selector_all('input[type="number"]')
-
-            if code_inputs and code_inputs[0].get_attribute("data-test-id") == "field_code_input":
-                pass
-            elif len(code_inputs) >= 4:
-                for i, ch in enumerate(code):
-                    if i < len(code_inputs):
-                        code_inputs[i].fill(ch)
-                        page.wait_for_timeout(100)
-            elif len(code_inputs) == 1:
-                code_inputs[0].fill(code)
-            else:
-                page.keyboard.type(code, delay=120)
-
-            page.wait_for_timeout(10000)
-            body_after_code = _safe_body_text(page, 1200)
-            if (
-                "неверный код" in body_after_code.lower()
-                or "ошибка" in body_after_code.lower()
-            ):
-                _save_wb_login_debug(page, "code_rejected")
-                raise RuntimeError("WB не принял код. Проверь код и запусти обновление заново.")
-
-            status_cb("💾 Сохраняю новую WB-сессию...")
-            try:
-                page.wait_for_url(lambda url: "wildberries.ru" in url and "id.wb.ru" not in url, timeout=20000)
-            except Exception:
-                pass
-
-            last_checks = {}
-            for target in ("https://www.wildberries.ru/lk", "https://www.wildberries.ru/"):
-                page.goto(target, timeout=30000, wait_until="domcontentloaded")
-                for _ in range(12):
-                    page.wait_for_timeout(2500)
-                    has_tokens, last_checks = _wb_context_has_auth_tokens(ctx, page)
-                    if has_tokens:
+                    body = _safe_body_text(page, 1600)
+                    if "/lk" in current_url or "Профиль" in body or "Заказы" in body:
+                        status_cb(
+                            "✅ WB уже открыл личный кабинет. "
+                            "Сохраняю токены из текущего браузерного state..."
+                        )
                         return _save_wb_session_from_context(ctx, page)
 
-            debug = _save_wb_login_debug(page, "missing_tokens_after_code")
-            raise RuntimeError(
-                "WB ID принял код, но www.wildberries.ru не выдал полный набор токенов: "
-                f"{last_checks}. Debug: html={debug.get('html') or '-'}, "
-                f"screenshot={debug.get('screenshot') or '-'}."
-            )
-        finally:
-            browser.close()
+                    debug = _save_wb_login_debug(page, "wait_phone_input")
+                    raise RuntimeError(
+                        "WB не показал поле ввода телефона за 5 минут. "
+                        f"URL={debug.get('url') or current_url}; title={title!r}. "
+                        f"Debug: html={debug.get('html') or '-'}, "
+                        f"screenshot={debug.get('screenshot') or '-'}. "
+                        f"Текст страницы: {body[:500]}"
+                    )
+
+                status_cb("✅ Проверка браузера пройдена. Ввожу номер телефона...")
+
+                if job.cancel_event.is_set():
+                    raise RuntimeError("Обновление отменено.")
+
+                phone_input = page.locator(phone_selector).first
+                phone_value = phone
+                try:
+                    input_id = phone_input.get_attribute("id") or ""
+                    data_test_id = phone_input.get_attribute("data-test-id") or ""
+                    if input_id == "wb-phone-number" or data_test_id == "field_phone_input":
+                        phone_value = phone[1:] if len(phone) == 11 and phone.startswith("7") else phone
+                except Exception:
+                    pass
+                phone_input.fill(phone_value)
+                page.wait_for_timeout(800)
+
+                rendered_phone = phone_input.input_value()
+                status_cb(f"📱 Номер введён: <b>{escape(rendered_phone)}</b>")
+
+                button = _visible_button_by_text(page, "Получить")
+                if not button:
+                    debug = _save_wb_login_debug(page, "no_get_code_button")
+                    raise RuntimeError(
+                        "Не нашёл кнопку «Получить код» на странице WB. "
+                        f"Debug: html={debug.get('html') or '-'}, "
+                        f"screenshot={debug.get('screenshot') or '-'}."
+                    )
+                button.click()
+
+                status_cb("📨 Запрашиваю код WB...")
+                code_screen = False
+                last_text = ""
+                for _ in range(90):
+                    if job.cancel_event.is_set():
+                        raise RuntimeError("Обновление отменено.")
+                    page.wait_for_timeout(1000)
+                    last_text = _safe_body_text(page, 1600)
+                    if "Некорректный формат номера" in last_text:
+                        raise RuntimeError(
+                            "WB отклонил номер как некорректный. "
+                            "Попробуй формат +7 999 123-45-67 или 79991234567."
+                        )
+                    if (
+                        "Откройте уведомление" in last_text
+                        or "Вам пришло уведомление" in last_text
+                        or page.query_selector('input[inputmode="numeric"]')
+                        or page.query_selector('input[data-test-id="field_code_input"]')
+                    ):
+                        code_screen = True
+                        break
+
+                if not code_screen:
+                    debug = _save_wb_login_debug(page, "no_code_screen")
+                    raise RuntimeError(
+                        "WB не открыл экран ввода кода. Последний текст страницы: "
+                        + last_text[:500]
+                        + f" Debug: html={debug.get('html') or '-'}, "
+                        + f"screenshot={debug.get('screenshot') or '-'}."
+                    )
+
+                status_cb(
+                    "✅ WB запросил код. Открой приложение Wildberries или SMS "
+                    "и отправь сюда 6 цифр. Браузер остаётся открытым 15 минут."
+                )
+
+                if not job.code_event.wait(timeout=900):
+                    raise RuntimeError("Истёк 15-минутный таймаут ожидания кода WB.")
+                if job.cancel_event.is_set():
+                    raise RuntimeError("Обновление отменено.")
+
+                code = job.code
+                status_cb("🔐 Ввожу код WB...")
+
+                code_inputs = page.query_selector_all('input[data-test-id="field_code_input"]')
+                if code_inputs:
+                    code_inputs[0].click()
+                    page.keyboard.type(code, delay=120)
+                else:
+                    code_inputs = page.query_selector_all('input[inputmode="numeric"]')
+                if not code_inputs:
+                    code_inputs = page.query_selector_all('input[type="tel"]')
+                if not code_inputs:
+                    code_inputs = page.query_selector_all('input[type="number"]')
+
+                if code_inputs and code_inputs[0].get_attribute("data-test-id") == "field_code_input":
+                    pass
+                elif len(code_inputs) >= 4:
+                    for i, ch in enumerate(code):
+                        if i < len(code_inputs):
+                            code_inputs[i].fill(ch)
+                            page.wait_for_timeout(100)
+                elif len(code_inputs) == 1:
+                    code_inputs[0].fill(code)
+                else:
+                    page.keyboard.type(code, delay=120)
+
+                page.wait_for_timeout(10000)
+                body_after_code = _safe_body_text(page, 1200)
+                if (
+                    "неверный код" in body_after_code.lower()
+                    or "ошибка" in body_after_code.lower()
+                ):
+                    _save_wb_login_debug(page, "code_rejected")
+                    raise RuntimeError("WB не принял код. Проверь код и запусти обновление заново.")
+
+                status_cb("💾 Получаю полный набор токенов WB...")
+                try:
+                    page.wait_for_url(
+                        lambda url: "wildberries.ru" in url and "id.wb.ru" not in url,
+                        timeout=20000,
+                    )
+                except Exception:
+                    pass
+
+                last_checks = {}
+                for target in ("https://www.wildberries.ru/lk", "https://www.wildberries.ru/"):
+                    page.goto(target, timeout=30000, wait_until="domcontentloaded")
+                    for _ in range(12):
+                        page.wait_for_timeout(2500)
+                        has_tokens, last_checks = _wb_context_has_auth_tokens(ctx, page)
+                        if has_tokens:
+                            return _save_wb_session_from_context(ctx, page)
+
+                debug = _save_wb_login_debug(page, "missing_tokens_after_code")
+                raise RuntimeError(
+                    "WB ID принял код, но www.wildberries.ru не выдал полный набор токенов: "
+                    f"{last_checks}. Debug: html={debug.get('html') or '-'}, "
+                    f"screenshot={debug.get('screenshot') or '-'}."
+                )
+            finally:
+                if ctx:
+                    try:
+                        ctx.storage_state(path=login_state_path)
+                    except Exception as e:
+                        logger.warning("WB working login state save failed: %s", e)
+                browser.close()
+    finally:
+        _stop_wb_virtual_display(virtual_display)
 
 
 def _verify_current_wb_session_sync() -> tuple[int, int]:
@@ -2920,6 +2977,9 @@ def _format_shelf_results(sku: str, competitors: list, results: dict,
 async def scheduled_parse():
     """Auto-parse only articles that users explicitly enabled."""
     logger.info("Scheduled auto-parse started")
+    if _wb_session_jobs:
+        logger.info("Scheduled auto-parse skipped while WB authorization is active")
+        return
     users = db.get_allowed_users()
 
     async def parse_user(uid):

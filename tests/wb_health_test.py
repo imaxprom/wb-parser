@@ -251,6 +251,23 @@ class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):
         submit.assert_not_awaited()
         verification.assert_not_called()
 
+    async def test_scheduler_pauses_while_wb_authorization_is_active(self):
+        submit = AsyncMock()
+        get_users = Mock(return_value=[{"telegram_id": 1}])
+        job = bot.WbSessionJob(phone="79991234567", chat_id=1)
+        bot._wb_session_jobs[1] = job
+        try:
+            with (
+                patch.object(bot.db, "get_allowed_users", get_users),
+                patch.object(bot.position_queue, "submit", submit),
+            ):
+                await bot.scheduled_parse()
+        finally:
+            bot._wb_session_jobs.pop(1, None)
+
+        get_users.assert_not_called()
+        submit.assert_not_awaited()
+
     async def test_position_parser_stops_batch_on_first_antibot_response(self):
         blocked = {
             "query": "first",
