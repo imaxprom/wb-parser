@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -114,6 +115,34 @@ class WbHealthTest(unittest.TestCase):
         self.assertEqual(data, {})
         self.assertEqual(error["error_state"], "auth_expired")
         self.assertEqual(error["status_code"], 401)
+
+    def test_login_resume_state_drops_antibot_cookies(self):
+        path = Path(self.temporary.name) / "login-state.json"
+        path.write_text(json.dumps({
+            "cookies": [
+                {"name": "wbid-refresh", "domain": ".id.wb.ru", "value": "keep"},
+                {"name": "__zzatw-wb-buyer", "domain": ".id.wb.ru", "value": "drop"},
+                {"name": "x_wbaas_token", "domain": "www.wildberries.ru", "value": "drop"},
+            ],
+            "origins": [
+                {
+                    "origin": "https://id.wb.ru",
+                    "localStorage": [
+                        {"name": "wbIdAccessToken", "value": "keep"},
+                        {"name": "__zzatw-wb-buyer", "value": "drop"},
+                    ],
+                },
+                {"origin": "https://www.wildberries.ru", "localStorage": []},
+            ],
+        }), encoding="utf-8")
+
+        clean = bot._load_clean_wb_login_state(str(path))
+
+        self.assertEqual([c["name"] for c in clean["cookies"]], ["wbid-refresh"])
+        self.assertEqual(clean["origins"], [{
+            "origin": "https://id.wb.ru",
+            "localStorage": [{"name": "wbIdAccessToken", "value": "keep"}],
+        }])
 
 
 class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):

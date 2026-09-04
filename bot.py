@@ -452,6 +452,44 @@ def _stop_wb_virtual_display(process: subprocess.Popen | None):
         process.kill()
 
 
+def _load_clean_wb_login_state(path: str) -> dict | None:
+    """Keep WB.ID authorization while dropping persisted anti-bot challenge state."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception:
+        return None
+
+    allowed_cookie_names = {
+        "wbid-refresh",
+        "wbid-validation-key",
+        "device_id",
+        "_wbauid",
+    }
+    cookies = [
+        cookie
+        for cookie in state.get("cookies", [])
+        if cookie.get("name") in allowed_cookie_names
+        and str(cookie.get("domain", "")).lstrip(".") == "id.wb.ru"
+    ]
+
+    origins = []
+    for origin in state.get("origins", []):
+        if origin.get("origin") != "https://id.wb.ru":
+            continue
+        local_storage = [
+            item
+            for item in origin.get("localStorage", [])
+            if item.get("name") == "wbIdAccessToken"
+        ]
+        if local_storage:
+            origins.append({"origin": "https://id.wb.ru", "localStorage": local_storage})
+
+    if not cookies and not origins:
+        return None
+    return {"cookies": cookies, "origins": origins}
+
+
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                                status_cb) -> dict:
     """Run WB buyer login in a blocking Playwright thread."""
@@ -480,8 +518,13 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                     "timezone_id": "Europe/Moscow",
                 }
                 if os.path.exists(login_state_path):
-                    context_args["storage_state"] = login_state_path
-                    status_cb("♻️ Продолжаю с сохранённого состояния страницы входа WB.")
+                    clean_login_state = _load_clean_wb_login_state(login_state_path)
+                    if clean_login_state:
+                        context_args["storage_state"] = clean_login_state
+                        status_cb(
+                            "♻️ Восстанавливаю принятую WB.ID-авторизацию "
+                            "без cookies неудачной антибот-проверки."
+                        )
 
                 ctx = browser.new_context(**context_args)
                 ctx.add_init_script(
@@ -507,12 +550,29 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                     'input#wb-phone-number'
                 )
                 phone_ready = False
+                account_selected = False
                 wait_started = time.time()
                 last_status_at = 0.0
                 while time.time() - wait_started < 300:
                     if job.cancel_event.is_set():
                         raise RuntimeError("Обновление отменено.")
                     try:
+                        has_tokens, _ = _wb_context_has_auth_tokens(ctx, page)
+                        if has_tokens:
+                            status_cb(
+                                "✅ WB.ID подтвердил сохранённый аккаунт. "
+                                "Сохраняю токены..."
+                            )
+                            return _save_wb_session_from_context(ctx, page)
+
+                        account_button = page.locator("button.account-select-button").first
+                        if not account_selected and account_button.is_visible():
+                            status_cb("👤 Выбираю подтверждённый аккаунт WB.ID...")
+                            account_selected = True
+                            account_button.click()
+                            page.wait_for_timeout(2000)
+                            continue
+
                         if page.locator(phone_selector).first.is_visible():
                             phone_ready = True
                             break
