@@ -258,6 +258,9 @@ def _validate_wb_code(raw: str) -> str | None:
 
 
 def _schedule_status(loop: asyncio.AbstractEventLoop, chat_id: int, text: str):
+    safe_log_text = re.sub(r"\+?\d[\d\s()-]{7,}\d", "[phone]", text)
+    logger.info("WB session status: %s", re.sub(r"<[^>]+>", "", safe_log_text))
+
     async def send():
         try:
             await bot.send_message(chat_id, text, parse_mode="HTML")
@@ -488,6 +491,13 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 status_cb("🌐 Открываю страницу входа WB...")
                 page.goto("https://www.wildberries.ru/", timeout=30000)
                 page.wait_for_timeout(3000)
+                has_tokens, _ = _wb_context_has_auth_tokens(ctx, page)
+                if has_tokens:
+                    status_cb(
+                        "✅ Сохранённое состояние входа уже авторизовано. "
+                        "Проверяю и сохраняю токены..."
+                    )
+                    return _save_wb_session_from_context(ctx, page)
                 page.goto("https://www.wildberries.ru/security/login", timeout=30000)
 
                 status_cb("🛡 Ожидаю завершения проверки браузера WB...")
@@ -611,28 +621,28 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 code = job.code
                 status_cb("🔐 Ввожу код WB...")
 
-                code_inputs = page.query_selector_all('input[data-test-id="field_code_input"]')
-                if code_inputs:
-                    code_inputs[0].click()
+                dedicated_code_inputs = page.query_selector_all(
+                    'input[data-test-id="field_code_input"]'
+                )
+                if dedicated_code_inputs:
+                    dedicated_code_inputs[0].click()
                     page.keyboard.type(code, delay=120)
                 else:
                     code_inputs = page.query_selector_all('input[inputmode="numeric"]')
-                if not code_inputs:
-                    code_inputs = page.query_selector_all('input[type="tel"]')
-                if not code_inputs:
-                    code_inputs = page.query_selector_all('input[type="number"]')
+                    if not code_inputs:
+                        code_inputs = page.query_selector_all('input[type="tel"]')
+                    if not code_inputs:
+                        code_inputs = page.query_selector_all('input[type="number"]')
 
-                if code_inputs and code_inputs[0].get_attribute("data-test-id") == "field_code_input":
-                    pass
-                elif len(code_inputs) >= 4:
-                    for i, ch in enumerate(code):
-                        if i < len(code_inputs):
-                            code_inputs[i].fill(ch)
-                            page.wait_for_timeout(100)
-                elif len(code_inputs) == 1:
-                    code_inputs[0].fill(code)
-                else:
-                    page.keyboard.type(code, delay=120)
+                    if len(code_inputs) >= 4:
+                        for i, ch in enumerate(code):
+                            if i < len(code_inputs):
+                                code_inputs[i].fill(ch)
+                                page.wait_for_timeout(100)
+                    elif len(code_inputs) == 1:
+                        code_inputs[0].fill(code)
+                    else:
+                        page.keyboard.type(code, delay=120)
 
                 page.wait_for_timeout(10000)
                 body_after_code = _safe_body_text(page, 1200)
