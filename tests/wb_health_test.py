@@ -144,6 +144,21 @@ class WbHealthTest(unittest.TestCase):
             "localStorage": [{"name": "wbIdAccessToken", "value": "keep"}],
         }])
 
+    def test_saved_login_accepts_oauth_consent_after_account_selection(self):
+        consent_button = Mock()
+        consent_button.is_visible.return_value = True
+        consent_button.inner_text.return_value = "Принять"
+        page = Mock()
+        page.query_selector_all.return_value = [consent_button]
+
+        action = bot._wb_saved_login_action(
+            page,
+            account_selected=True,
+            consent_accepted=False,
+        )
+
+        self.assertEqual(action, ("consent", consent_button))
+
 
 class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

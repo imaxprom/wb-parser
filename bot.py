@@ -280,6 +280,21 @@ def _visible_button_by_text(page, needle: str):
     return None
 
 
+def _wb_saved_login_action(page, *, account_selected: bool, consent_accepted: bool):
+    """Return the next action needed to resume an already confirmed WB.ID login."""
+    if not account_selected:
+        account_button = page.locator("button.account-select-button").first
+        if account_button.is_visible():
+            return "account", account_button
+
+    if not consent_accepted:
+        consent_button = _visible_button_by_text(page, "Принять")
+        if consent_button:
+            return "consent", consent_button
+
+    return None
+
+
 def _safe_body_text(page, limit: int = 1000) -> str:
     try:
         return re.sub(r"\s+", " ", page.inner_text("body"))[:limit]
@@ -551,6 +566,7 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                 )
                 phone_ready = False
                 account_selected = False
+                consent_accepted = False
                 wait_started = time.time()
                 last_status_at = 0.0
                 while time.time() - wait_started < 300:
@@ -565,11 +581,27 @@ def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                             )
                             return _save_wb_session_from_context(ctx, page)
 
-                        account_button = page.locator("button.account-select-button").first
-                        if not account_selected and account_button.is_visible():
+                        saved_login_action = _wb_saved_login_action(
+                            page,
+                            account_selected=account_selected,
+                            consent_accepted=consent_accepted,
+                        )
+                        if saved_login_action:
+                            action_name, action_button = saved_login_action
+                        else:
+                            action_name, action_button = None, None
+
+                        if action_name == "account":
                             status_cb("👤 Выбираю подтверждённый аккаунт WB.ID...")
+                            action_button.click()
                             account_selected = True
-                            account_button.click()
+                            page.wait_for_timeout(2000)
+                            continue
+
+                        if action_name == "consent":
+                            status_cb("✅ Подтверждаю доступ Wildberries к WB.ID...")
+                            action_button.click()
+                            consent_accepted = True
                             page.wait_for_timeout(2000)
                             continue
 
