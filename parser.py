@@ -500,15 +500,14 @@ _GEO_SEMAPHORE = asyncio.Semaphore(3)
 
 async def _geo_scan_region(sku: str, query: str,
                            region: dict, pages_depth: int) -> dict:
-    """Scan one region for a SKU via curl_cffi (chrome TLS) — обходит anti-bot.
-    Без Bearer, чтобы dest не игнорировался в пользу домашнего региона."""
+    """Scan one region through the working WB search host with current auth."""
     import proxy_positions
     from curl_cffi import requests as curl_requests
 
     async with _GEO_SEMAPHORE:
         def fetch_page(page: int) -> tuple[int, list[dict]]:
             """Returns (status_code, products). status=0 on exception."""
-            headers = proxy_positions._build_headers("__direct__", with_bearer=False)
+            headers = proxy_positions._build_headers("__direct__")
             params = {
                 "appType": WB_APP_TYPE,
                 "curr": "rub",
@@ -522,7 +521,7 @@ async def _geo_scan_region(sku: str, query: str,
             }
             try:
                 resp = curl_requests.get(
-                    WB_SEARCH_URL, params=params, headers=headers,
+                    proxy_positions.SEARCH_URL, params=params, headers=headers,
                     impersonate="chrome", timeout=10,
                 )
                 if resp.status_code == 200:
