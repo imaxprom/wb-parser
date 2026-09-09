@@ -46,6 +46,10 @@ class ProxyPositionsTest(unittest.TestCase):
         region = {"name": "Москва", "short": "МСК", "dest": "-1257786"}
 
         with (
+            patch.object(proxy_positions, "_token_cache", {}),
+            patch.object(proxy_positions, "_wb_session", {}),
+            patch.object(proxy_positions, "_load_token_cache") as load_token_cache,
+            patch.object(proxy_positions, "_load_wb_session") as load_wb_session,
             patch.object(
                 proxy_positions,
                 "_build_headers",
@@ -57,6 +61,8 @@ class ProxyPositionsTest(unittest.TestCase):
                 parser.geo_scan("123", "query", [region], pages_depth=1)
             )
 
+        load_token_cache.assert_called_once_with()
+        load_wb_session.assert_called_once_with()
         build_headers.assert_called_once_with("__direct__")
         self.assertEqual(request.call_args.args[0], proxy_positions.SEARCH_URL)
         self.assertEqual(

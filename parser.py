@@ -555,6 +555,13 @@ async def _geo_scan_region(sku: str, query: str,
 
 async def geo_scan(sku: str, query: str, regions: list[dict], pages_depth: int = 5) -> list[dict]:
     """Scan one SKU + query across multiple regions in parallel. Returns [{short, name, position}, ...]."""
+    import proxy_positions
+
+    if not proxy_positions._token_cache:
+        proxy_positions._load_token_cache()
+    if not proxy_positions._wb_session:
+        proxy_positions._load_wb_session()
+
     tasks = [_geo_scan_region(sku, query, r, pages_depth) for r in regions]
     results = await asyncio.gather(*tasks)
 
