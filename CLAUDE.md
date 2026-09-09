@@ -1,87 +1,61 @@
 # Правила работы с проектом WB Parser
 
-## Изоляция
-- Работай ТОЛЬКО внутри `/Users/octopus/Projects/wb-parser/`
-- ЗАПРЕЩЕНО читать, писать, удалять файлы за пределами этой папки
-- ЗАПРЕЩЕНО обращаться к другим проектам, копировать код из них, ссылаться на них
+Last verified: 2026-09-09 23:23 MSK.
 
-## База данных
-- Чтение и редактирование .db файлов внутри папки проекта — разрешено
+## Изоляция и безопасность
 
-## Внешние подключения
-- ЗАПРЕЩЕНО загружать внешние пакеты или зависимости без согласования
+- Работай с кодом только в `/Users/octopus/Projects/wb-parser/`, кроме явно запрошенного пользователем обновления памяти Codex.
+- Чтение и редактирование SQLite внутри проекта разрешено.
+- Не устанавливай внешние пакеты без согласования.
+- Не печатай, не коммить и не записывай в документацию значения `.env`, cookies, session JSON, токены, пароли, API-ключи, прокси-учётные данные, worker secrets и database URLs.
+- Существующие незакоммиченные изменения принадлежат пользователю. Сейчас таким изменением является `deploy/wb-cart-stock-worker.service`; сохраняй его отдельно от несвязанных задач.
 
-## Стек проекта
-- Python 3.12 (VPS) / 3.13 (Mac), aiogram 3, aiohttp, curl_cffi, APScheduler, matplotlib, openpyxl, playwright
-- SQLite (WAL mode) — per-user БД
-- Виртуальное окружение: `./venv/`
+## Архитектура
 
-## Архитектура: Mac (разработка) → GitHub → VPS (продакшн)
+- Mac `/Users/octopus/Projects/wb-parser`: разработка.
+- GitHub `imaxprom/wb-parser`, ветка `main`: источник версий.
+- VPS по alias `ssh wb-parser`, путь `~/wb-parser`: production.
+- Production-ветка называется `master`, но deploy fast-forward’ит её из `origin/main`.
+- Python 3.13 локально, Python 3.12 на VPS, aiogram 3, curl_cffi, aiohttp, APScheduler, Playwright и SQLite.
 
-### Где что работает
-- **Mac** (`/Users/octopus/Projects/wb-parser/`) — ТОЛЬКО разработка, код правим тут
-- **GitHub** (`imaxprom/wb-parser`, private) — хранилище версий
-- **VPS wb-parser** (`192.168.55.102`, user `makson`) — ПРОДАКШН, бот работает тут
+## Обязательный порядок после изменения кода
 
-### Деплой — ОБЯЗАТЕЛЬНЫЙ порядок после ЛЮБОГО изменения кода
-1. Правим код на Mac
-2. Коммитим: `git add <файлы> && git commit -m "описание"`
-3. Пушим: `git push`
-4. Деплоим: `ssh wb-parser "~/wb-parser/deploy.sh"`
-5. Проверяем логи: `ssh wb-parser "sudo journalctl -u wb-parser --no-pager -n 10"`
+1. Изменить код локально через аккуратный patch.
+2. Запустить релевантные тесты; полный набор: `./venv/bin/python -m unittest discover -s tests -p '*_test.py'`.
+3. Коммитить только относящиеся к задаче файлы и выполнить `git push`.
+4. Выполнить `ssh wb-parser "~/wb-parser/deploy.sh"`.
+5. Проверить статусы и свежие логи `wb-parser.service`; для worker-задач также `wb-cart-stock-worker.service`.
 
-**НИКОГДА** не забывай деплоить после изменений. Код на Mac без деплоя — мёртвый код.
+Документные context-only изменения можно пушить без перезапуска production-сервиса.
 
-### Откат
-```
-git log                    # история
-git revert HEAD            # откат последнего коммита
-git push
-ssh wb-parser "~/wb-parser/deploy.sh"
-```
+## Текущий runtime
 
-## Подключение к VPS
-- `ssh wb-parser` — подключение (через ProxyJump proxmox-jump)
-- Сервисы: `wb-parser.service`, `ssh-tunnel-telegram.service`
-- Логи бота: `sudo journalctl -u wb-parser --no-pager -n 50`
-- Перезапуск: `sudo systemctl restart wb-parser`
+- Проверенный код: `4f18b6e Load WB session before geo scan`.
+- `wb-parser.service` и `wb-cart-stock-worker.service` активны.
+- Основной парсер: `proxy_positions.py`, production работает напрямую без WB-прокси.
+- Рабочий search endpoint: `https://search.wb.ru/exactmatch/ru/common/v18/search`.
+- Geo использует этот же endpoint, действующую сессию и 8 прежних регионов; production-проверка успешна.
+- Shelf scanner пока использует заблокированный `www/__internal/recom` endpoint. Проверенный, но ещё не внедрённый адрес: `https://recom.wb.ru/recom/ru/common/v8/search`.
+- Полная локальная тестовая проверка: 24 теста.
 
-## Парсинг WB — ключевые решения
-- **proxy_positions.py** — основной парсер (curl_cffi + авторизация покупателя)
-- **Текущий прод-режим**: direct WB requests через `curl_cffi`; на проде `WB_PROXY_*` не настроены
-- **Текущая стратегия запросов**: последовательные fetch через `curl_cffi.Session`; параллельная пачка direct-запросов ранее приводила к 403/anti-bot
-- **Авторизация**: Bearer + cookies из `data/wb_session.json`, `x_wbaas_token` из cache/session; `X-Pow` в direct mode не отправляется
-- **Обязательный browser-header с 2026-07-06**: `deviceid` из `localStorage["wbx__sessionID"]`. Без него prod direct search возвращал `403 Angie`; с ним `__internal/search` вернул `200` и 300 товаров
-- **Дополнительные WB browser-headers**: `x-spa-version: 14.2.3`, `X-Userid`, `X-Queryid`, cookies `x_wbaas_token` и `_wbauid`
-- **Без авторизации данные нестабильны** — рекламные позиции мигают
-- **Retry**: если WB вернул пустые данные (error=True), автоматический повтор через 0.5 сек
-- **chrome_positions.py** — старый подход (AppleScript, Mac only), сохранён как запасной
-- **scripts/wb_manual_auth_local.py** — ручное локальное обновление WB-сессии через видимый Chromium; поддерживает proxy-аргументы, но браузерный путь не является основным парсером
+## Авторизация WB
 
-## Telegram на VPS
-- Telegram API заблокирован на VPS напрямую
-- Трафик идёт через SSH-туннель: `wb-parser:1080` → германская VPS `89.125.73.111`
-- Сервис: `ssh-tunnel-telegram.service` (автозапуск, автореконнект)
-- Настройка в `.env`: `TELEGRAM_PROXY=socks5://127.0.0.1:1080`
+- Авторизация запускается владельцем через Telegram: телефон, затем шестизначный код.
+- Используется headed Chromium в Xvfb, а не headless login.
+- Рабочее промежуточное WB.ID-состояние отделено от активной session.
+- Resume-путь выбирает сохранённый аккаунт и принимает OAuth-согласие.
+- Новая session проверяется реальным search-запросом; scheduler пропускает цикл, пока идёт интерактивная авторизация.
 
-## Германская VPS (SSH-туннель)
-- IP: `89.125.73.111`, root, порт 22
-- На ней Amnezia (Docker, UDP 1274) — НЕ ТРОГАТЬ
-- SSH-туннель wb-parser использует только SSH — конфликтов с Amnezia нет
-- Эту VPS могут использовать и другие проекты для SSH-туннелей
+## UI и нагрузка
 
-## .env на VPS (НЕ в Git)
-```
-WB_PARSER_BOT_TOKEN=...
-PARSE_MODE=proxy
-TELEGRAM_PROXY=socks5://127.0.0.1:1080
-```
+- Главное Telegram-меню — постоянная ReplyKeyboard; inline-кнопки управляют содержимым разделов.
+- Обычный поиск идёт через последовательную общую очередь и не делает отдельный preflight.
+- Автопроверка включена только для 2 товаров владельца (12 ключей) раз в 20 минут; другие пользователи scheduled-нагрузку не создают.
+- Geo оставлен в прежней схеме по просьбе пользователя; возможное сокращение глубины и улучшение отображения ошибок — отдельная задача.
 
-## Текущее состояние на 2026-07-06
-- Последний проверенный кодовый коммит: `7467d3d Add WB device id header`
-- Контекстные markdown-файлы могут быть сохранены отдельным более новым коммитом без рестарта сервиса
-- `npm run save-session-state` в этом репозитории не работает: нет `package.json`
-- Локальная БД: `alerts=3`, `allowed_users=4`, `articles=4`, `queries=24`, `results=1783`, `settings=3`, `wb_tokens=2`
-- Продовая БД: `alerts=3`, `allowed_users=4`, `articles=4`, `queries=24`, `results=1783`, `settings=3`, `wb_tokens=1`
-- Prod verification после фикса: `bot._verify_current_wb_session_sync()` вернул `(200, 300)`
-- `KnowledgeBase.tsx` в этом проекте отсутствует; UI/React части нет
+## Состояние и память
+
+- Перед продолжением читай `SESSION_STATE.md`, `PROJECT_CONTEXT.md`, `TODO.md` и эту инструкцию.
+- `npm run save-session-state` недоступен: в Python-проекте нет `package.json`.
+- `KnowledgeBase.tsx` отсутствует, React UI в репозитории нет.
+- Production содержит untracked operational files/backups; не удалять без явного разрешения.
