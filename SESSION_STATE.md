@@ -4,7 +4,7 @@ Last verified: 2026-09-09 23:23 MSK.
 
 ## Current state
 
-- Git is synchronized at `4f18b6e Load WB session before geo scan` on local `main`, `origin/main`, and production.
+- Verified application code is `4f18b6e Load WB session before geo scan`; newer commits are context-only. Local `main`, `origin/main`, and production should be kept at the same context HEAD without restarting services.
 - Production Git branch is named `master`; `~/wb-parser/deploy.sh` fast-forwards it from `origin/main`.
 - `wb-parser.service` and `wb-cart-stock-worker.service` are active with zero recorded restarts in their current runs.
 - Local worktree has one pre-existing user change: `deploy/wb-cart-stock-worker.service`. Do not overwrite or discard it. Its Xvfb/browser-proxy/watchdog settings match the currently installed production unit.
