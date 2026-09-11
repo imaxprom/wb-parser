@@ -84,9 +84,9 @@ def _get_wbaas_token(proxy_raw: str) -> str:
 
 _UA = WB_BROWSER_USER_AGENT
 
-# The www/__internal route is challenged with HTTP 498 from the production IP,
-# while WB's search host serves the same v18 payload and current ad positions.
-SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v18/search"
+# Use the website route with the current buyer session. The standalone search
+# host rejects production requests with HTTP 403 even after a fresh login.
+SEARCH_URL = config.WB_SEARCH_URL
 
 # Authenticated session data (from wb_session.json)
 _wb_session: dict = {}

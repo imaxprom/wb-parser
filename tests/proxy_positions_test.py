@@ -12,7 +12,7 @@ class ProxyPositionsTest(unittest.TestCase):
     def test_uses_working_wb_search_host_and_configured_destination(self):
         self.assertEqual(
             proxy_positions.SEARCH_URL,
-            "https://search.wb.ru/exactmatch/ru/common/v18/search",
+            "https://www.wildberries.ru/__internal/search/exactmatch/ru/common/v18/search",
         )
         self.assertEqual(proxy_positions.DEST, int(config.WB_DEST))
 
