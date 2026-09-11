@@ -157,6 +157,8 @@ def main_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
     )
 
 
