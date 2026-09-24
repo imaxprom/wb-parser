@@ -80,13 +80,49 @@ def session_metadata():
     return result
 
 
-def probe(*, reload=True):
+def full_probe(sku=0):
+    """Exercise the real four-page parser, recording only response metadata."""
+    started = time.monotonic()
+    responses = []
+    with positions.curl_requests.Session(impersonate=positions.WB_CURL_IMPERSONATE) as client:
+        class ObservedClient:
+            def get(self, *args, **kwargs):
+                item = {"page": kwargs["params"].get("page"),
+                        "variant": kwargs["params"].get("ab_testid", "normal")}
+                responses.append(item)
+                response = client.get(*args, **kwargs)
+                item["status"] = response.status_code
+                retry = getattr(response, "headers", {}).get("Retry-After", "")
+                item["retry_after"] = int(retry) if retry.isdigit() else 0
+                item["antibot"] = is_antibot_response(response.status_code, getattr(response, "text", "")[:2000])
+                try:
+                    item["products"] = len(response.json().get("products", []))
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                return response
+        parsed = positions._fetch_keyword_sync("", QUERY, sku, int(config.WB_DEST), ObservedClient())
+    state = (parsed.get("error_state") or "invalid_response") if parsed.get("error") else "healthy"
+    if any(r.get("antibot") for r in responses):
+        state = "antibot"
+    return {
+        "state": state,
+        "status": parsed.get("status_code") if parsed.get("error") else 200,
+        "retry_after": max((r.get("retry_after", 0) for r in responses), default=0),
+        "mode": "full_parser", "responses": responses,
+        "promo_pos": parsed.get("promo_pos"), "organic_pos": parsed.get("organic_pos"),
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+    }
+
+
+def probe(*, reload=True, full=False, sku=0):
     if reload:
         positions._load_token_cache()
         positions._load_wb_session()
     started = time.monotonic()
     status = None
     try:
+        if full:
+            return full_probe(sku)
         response = positions.curl_requests.get(
             positions.SEARCH_URL, params=PARAMS,
             headers=positions._build_headers("__direct__"),
@@ -255,9 +291,10 @@ def report(directory, state):
     lines = ["# Наблюдение за WB-сессией", "",
              f"Начало: {stamp(state['start_at'])}. Плановое окончание: {stamp(state['end_at'])}.",
              f"Статус: {'завершено' if state.get('complete') else 'идёт наблюдение'}. Наблюдалось часов: {elapsed / 3600:.2f}.",
-             f"Контроль: один поисковый запрос каждые {state['interval']} секунд, с паузами при отказах.",
+             f"Контроль: один замер каждые {state['interval']} секунд, с паузами при отказах.",
              "Используется сохранённый покупательский аккаунт на production, текущий поисковый endpoint и фиксированный запрос.",
              f"Ответы контрольного поиска: {dict(counts)}. Попыток обновления: {len(recoveries)}.",
+             f"Полный цикл рабочего парсера включается через {state.get('full_after_hours', 2)} ч от начала; контрольный SKU: {state.get('sku', 0)}. В этом режиме один замер содержит до четырёх последовательных HTTP-запросов.",
              "", "## Хронология отказов и восстановления", ""]
     for event in events:
         if event["event"] == "refresh" or (event["event"] in ("probe", "verification") and event["result"]["state"] != "healthy"):
@@ -294,7 +331,7 @@ def report(directory, state):
     os.replace(temporary, directory / "report.md")
 
 
-def run(directory, hours, interval):
+def run(directory, hours, interval, full_after_hours=2, sku=0):
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (Path(config.DATA_DIR) / "wb_session_monitor.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -307,6 +344,8 @@ def run(directory, hours, interval):
             atomic_json(state_path, state)
             emit(directory, "start", session=session_metadata(), interval=interval, end_at=state["end_at"])
         interval = state["interval"]
+        state.setdefault("full_after_hours", full_after_hours)
+        state.setdefault("sku", sku)
         while time.time() < state["end_at"]:
             if time.time() < state["next_at"]:
                 time.sleep(max(0, min(5, state["next_at"] - time.time(), state["end_at"] - time.time())))
@@ -314,7 +353,12 @@ def run(directory, hours, interval):
             observed_at = time.time()
             emit(directory, "production_load", result=production_load(state.get("load_until", state["start_at"]), observed_at))
             state["load_until"] = observed_at
-            result = probe()
+            full = observed_at - state["start_at"] >= state["full_after_hours"] * 3600
+            mode = "full_parser" if full else "single_page"
+            if state.get("mode") != mode:
+                emit(directory, "phase", mode=mode, sku=state["sku"])
+                state["mode"] = mode
+            result = probe(full=full, sku=state["sku"])
             metadata = session_metadata()
             emit(directory, "probe", result=result, session=metadata)
             # After a cooldown, test the old session first: distinguish natural
@@ -323,7 +367,7 @@ def run(directory, hours, interval):
                 renewal = refresh_subprocess()
                 emit(directory, "refresh", result=renewal, session=session_metadata(), previous_session=metadata)
                 if renewal["state"] == "refreshed":
-                    result = probe()
+                    result = probe(full=full, sku=state["sku"])
                     emit(directory, "verification", result=result, session=session_metadata())
                 else:
                     result = renewal
@@ -345,6 +389,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hours", type=float, default=12)
     parser.add_argument("--interval", type=int, default=300)
+    parser.add_argument("--full-after-hours", type=float, default=2)
+    parser.add_argument("--sku", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path(config.DATA_DIR) / "session-observation")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--once", action="store_true")
@@ -360,9 +406,9 @@ def main():
     elif args.once:
         print(json.dumps({"result": probe(), "session": session_metadata()}))
     else:
-        if args.hours <= 0 or args.interval < 60:
+        if args.hours <= 0 or args.interval < 60 or args.full_after_hours < 0:
             parser.error("hours must be positive; interval must be at least 60 seconds")
-        run(args.output, args.hours, args.interval)
+        run(args.output, args.hours, args.interval, args.full_after_hours, args.sku)
 
 
 if __name__ == "__main__":

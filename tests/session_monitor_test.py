@@ -39,10 +39,11 @@ class SessionMonitorTest(unittest.TestCase):
         state = {"start_at": 100, "end_at": 1000, "interval": 300, "next_at": 100,
                  "failures": 1, "recover_pending": True, **initial}
         monitor.atomic_json(directory / "state.json", state)
-        def complete_probe():
+        results = iter(result if isinstance(result, list) else [result])
+        def complete_probe(**kwargs):
             # The current iteration runs; its next loop finishes the experiment.
             state_time[0] = 500
-            return result
+            return next(results)
         state_time = [200]
         real_write = monitor.atomic_json
         def finish_iteration(path, data):
@@ -67,11 +68,45 @@ class SessionMonitorTest(unittest.TestCase):
         renew.assert_not_called()
         self.assertEqual(state["next_at"], 1400)
 
+    def test_successful_refresh_requires_successful_recheck(self):
+        renew, state = self._cycle({}, [{"state": "antibot"}, {"state": "healthy"}], {"state": "refreshed"})
+        renew.assert_called_once_with()
+        self.assertEqual(state["failures"], 0)
+        self.assertFalse(state["recover_pending"])
+
+    def test_rejected_recheck_preserves_failure_backoff(self):
+        _, state = self._cycle({}, [{"state": "antibot"}, {"state": "antibot"}], {"state": "refreshed"})
+        self.assertEqual(state["failures"], 2)
+        self.assertTrue(state["recover_pending"])
+        self.assertEqual(state["next_at"], 2300)
+
     def test_existing_auth_cache_is_reloaded_at_batch_boundary(self):
         with patch.object(proxy_positions, "_wb_session", {"saved_at": 1}), patch.object(proxy_positions, "_token_cache", {"__direct__": {}}), patch.object(proxy_positions, "_load_wb_session") as session, patch.object(proxy_positions, "_load_token_cache") as cookies, patch.object(proxy_positions.curl_requests, "Session"), patch.object(proxy_positions.config, "WB_PROXIES", []):
             asyncio.run(proxy_positions.get_positions(1, []))
         session.assert_called_once_with()
         cookies.assert_called_once_with()
+
+    def test_full_probe_checks_all_four_pages_and_extracts_positions(self):
+        response = SimpleNamespace(status_code=200, json=lambda: {"products": [{"id": 123}]})
+        with patch.object(monitor.positions.curl_requests, "Session") as session, patch.object(monitor.positions, "_build_headers", return_value={}):
+            client = session.return_value.__enter__.return_value
+            client.get.return_value = response
+            result = monitor.full_probe(123)
+        self.assertEqual(result["state"], "healthy")
+        self.assertIsNotNone(result["promo_pos"])
+        self.assertIsNotNone(result["organic_pos"])
+        self.assertEqual([(r["page"], r["variant"]) for r in result["responses"]],
+                         [("1", "normal"), ("2", "normal"), ("1", "no_promo"), ("2", "no_promo")])
+
+    def test_full_probe_stops_at_first_rejection(self):
+        response = SimpleNamespace(status_code=498, json=lambda: {})
+        with patch.object(monitor.positions.curl_requests, "Session") as session, patch.object(monitor.positions, "_build_headers", return_value={}):
+            client = session.return_value.__enter__.return_value
+            client.get.return_value = response
+            result = monitor.full_probe(123)
+        self.assertEqual(result["state"], "antibot")
+        self.assertEqual(result["status"], 498)
+        client.get.assert_called_once()
 
 
 if __name__ == "__main__":
