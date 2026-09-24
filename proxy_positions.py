@@ -188,6 +188,7 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
 def _search_sync(headers: dict, params: dict, proxy_url: str = None,
                  session: curl_requests.Session = None) -> tuple[dict, dict | None]:
     """Single search request. Returns (data, classified_error)."""
+    started = time.monotonic()
     try:
         kwargs = {
             "params": params,
@@ -200,6 +201,11 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
 
         client = session if session else curl_requests
         resp = client.get(SEARCH_URL, **kwargs)
+        logger.info(
+            "WB search response: status=%s elapsed_ms=%d session_saved_at=%s",
+            resp.status_code, int((time.monotonic() - started) * 1000),
+            _wb_session.get("saved_at", 0),
+        )
         if resp.status_code == 200:
             return resp.json(), None
         if resp.status_code in RATE_LIMIT_HTTP_STATUSES:
@@ -419,10 +425,10 @@ async def get_positions(article: int, keywords: list[str],
         ...
     }
     """
-    if not _token_cache:
-        _load_token_cache()
-    if not _wb_session:
-        _load_wb_session()
+    # Another process can renew auth while the bot is running. Reload both
+    # files at each batch boundary so old cached cookies cannot mask renewal.
+    _load_token_cache()
+    _load_wb_session()
 
     # Direct mode (no proxies) or proxy mode
     proxy_raw = config.WB_PROXIES[0] if config.WB_PROXIES else ""
