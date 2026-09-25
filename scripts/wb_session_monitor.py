@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 import proxy_positions as positions
-from wb_health import is_antibot_response
+from wb_health import is_antibot_response, retry_after_seconds
 
 QUERY = "трусы женские"
 PARAMS = {
@@ -94,7 +94,7 @@ def full_probe(sku=0):
                 item["status"] = response.status_code
                 response_headers = getattr(response, "headers", {})
                 retry = response_headers.get("Retry-After", "")
-                item["retry_after"] = int(retry) if retry.isdigit() else 0
+                item["retry_after"] = retry_after_seconds(retry)
                 body = getattr(response, "text", "")
                 item["antibot"] = is_antibot_response(response.status_code, body[:2000])
                 # Values of Set-Cookie, auth headers and response bodies must
@@ -140,7 +140,7 @@ def probe(*, reload=True, full=False, sku=0):
         )
         status = response.status_code
         retry_after = response.headers.get("Retry-After", "")
-        retry_seconds = int(retry_after) if retry_after.isdigit() else 0
+        retry_seconds = retry_after_seconds(retry_after)
         if status == 429:
             state = "rate_limited"
         elif status == 401:

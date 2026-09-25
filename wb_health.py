@@ -5,6 +5,8 @@ import json
 import os
 import re
 import time
+import math
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import config
@@ -26,6 +28,17 @@ ANTIBOT_MAX_COOLDOWN_SECONDS = 2 * 60 * 60
 RATE_LIMIT_COOLDOWN_SECONDS = 10 * 60
 NETWORK_ERROR_COOLDOWN_SECONDS = 2 * 60
 AUTH_EXPIRED_RECHECK_SECONDS = 6 * 60 * 60
+
+
+def retry_after_seconds(value: str | None) -> int:
+    """Honor both delta-seconds and HTTP-date forms of Retry-After."""
+    value = str(value or "").strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        return max(0, math.ceil(parsedate_to_datetime(value).timestamp() - time.time()))
+    except (ValueError, TypeError, OverflowError):
+        return 0
 
 _STATE_PATH = Path(config.DATA_DIR) / "wb_access_health.json"
 _LOCK_PATH = Path(config.DATA_DIR) / "wb_access_health.lock"

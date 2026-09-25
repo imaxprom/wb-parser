@@ -166,10 +166,13 @@ class BotWbHealthTest(unittest.IsolatedAsyncioTestCase):
         directory = Path(self.temporary.name)
         self.state_patch = patch.object(wb_health, "_STATE_PATH", directory / "health.json")
         self.lock_patch = patch.object(wb_health, "_LOCK_PATH", directory / "health.lock")
+        self.data_patch = patch.object(proxy_positions.config, "DATA_DIR", str(directory))
+        self.data_patch.start()
         self.state_patch.start()
         self.lock_patch.start()
 
     def tearDown(self):
+        self.data_patch.stop()
         self.lock_patch.stop()
         self.state_patch.stop()
         self.temporary.cleanup()

@@ -509,6 +509,15 @@ def _load_clean_wb_login_state(path: str) -> dict | None:
 
 def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
                                status_cb) -> dict:
+    """Serialize interactive login with automatic and cart-session refreshes."""
+    import fcntl
+    with open(os.path.join(config.DATA_DIR, "wb_session_refresh.lock"), "a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _run_wb_session_login_unlocked(phone, job, status_cb)
+
+
+def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
+                                  status_cb) -> dict:
     """Run WB buyer login in a blocking Playwright thread."""
     from playwright.sync_api import sync_playwright
 
@@ -1945,7 +1954,17 @@ def _evirma_error_notice(position_sets: list[dict]) -> str:
         reason = "WB-сессия истекла"
     else:
         reason = "WB не вернул полные данные"
-    return f"\n⚠️ {len(errors)} запросов не выполнены: {reason} (HTTP {status_text})."
+    notice = f"\n⚠️ {len(errors)} запросов не выполнены: {reason} (HTTP {status_text})."
+    recovery_reasons = {item.get("recovery_reason") for item in errors}
+    if "login_required" in recovery_reasons:
+        notice += " WB запросил подтверждение входа. Используйте «Обновить WB-сессию» в меню."
+    elif "login_in_progress" in recovery_reasons:
+        notice += " Обновление сессии уже выполняется; повторите проверку немного позже."
+    else:
+        retry_after = max((item.get("retry_after") or 0 for item in errors), default=0)
+        if retry_after:
+            notice += f" Повторная проверка доступна через {(retry_after + 59) // 60} мин."
+    return notice
 
 
 def _format_evirma_results(sku: str, keywords: list[str], positions: dict, elapsed: float = None, name: str = "") -> str:

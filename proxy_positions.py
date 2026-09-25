@@ -19,12 +19,14 @@ from typing import Optional
 from curl_cffi import requests as curl_requests
 
 import config
+import wb_search_recovery
 from wb_health import (
     ANTIBOT_HTTP_STATUSES,
     AUTH_HTTP_STATUSES,
     RATE_LIMIT_HTTP_STATUSES,
     WB_BROWSER_USER_AGENT,
     WB_CURL_IMPERSONATE,
+    retry_after_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,10 +210,12 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         )
         if resp.status_code == 200:
             return resp.json(), None
+        retry_after = retry_after_seconds(getattr(resp, "headers", {}).get("Retry-After"))
         if resp.status_code in RATE_LIMIT_HTTP_STATUSES:
             logger.warning("429 rate limit")
             return {}, {
                 "error_state": "rate_limited",
+                "retry_after": retry_after,
                 "status_code": resp.status_code,
                 "error_message": f"WB rate limit: HTTP {resp.status_code}",
             }
@@ -219,6 +223,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
             logger.warning("%d anti-bot block", resp.status_code)
             return {}, {
                 "error_state": "antibot",
+                "retry_after": retry_after,
                 "status_code": resp.status_code,
                 "error_message": f"WB anti-bot protection: HTTP {resp.status_code}",
             }
@@ -226,12 +231,14 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
             logger.warning("%d expired WB session", resp.status_code)
             return {}, {
                 "error_state": "auth_expired",
+                "retry_after": retry_after,
                 "status_code": resp.status_code,
                 "error_message": f"WB session expired: HTTP {resp.status_code}",
             }
         logger.warning("HTTP %d from WB", resp.status_code)
         return {}, {
             "error_state": "network_error",
+            "retry_after": retry_after,
             "status_code": resp.status_code,
             "error_message": f"WB search returned HTTP {resp.status_code}",
         }
@@ -437,51 +444,60 @@ async def get_positions(article: int, keywords: list[str],
     logger.info("Fetching positions for %d: %d keywords (%s)", article, len(keywords), mode)
 
     result = {}
-    blocked_error = None
-
-    # Session for connection reuse (T08 strategy)
-    session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE) if not proxy_raw else None
-
-    for kw in keywords:
-        item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
-
-        # Retry only a transient/incomplete response.  Classified WB rejections
-        # stop immediately so the bot never turns one failure into a burst.
-        if item.get("error"):
-            error_state = item.get("error_state")
-            if not error_state or error_state == "network_error":
-                logger.warning("Retry '%s' for %d (transient response)", kw, article)
+    blocked_error = wb_search_recovery.cooldown_error(_wb_session.get("saved_at", 0))
+    recovery_used = False
+    access_errors = {"antibot", "auth_expired", "rate_limited"}
+    session = None
+    try:
+        if not blocked_error and not proxy_raw and keywords:
+            session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE)
+        for kw in keywords:
+            if blocked_error:
+                break
+            generation = _wb_session.get("saved_at", 0)
+            item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
+            if item.get("error") and item.get("error_state") in (None, "network_error") and not item.get("retry_after"):
                 await asyncio.sleep(0.5)
-                item = await asyncio.to_thread(
-                    _fetch_keyword_sync, proxy_raw, kw, article, dest, session
+                item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
+            if item.get("error") and (item.get("error_state") in access_errors or item.get("retry_after")):
+                recovered = await asyncio.to_thread(
+                    wb_search_recovery.recover, item, generation,
+                    allow_refresh=not recovery_used and not proxy_raw,
                 )
-                error_state = item.get("error_state")
+                if recovered:
+                    recovery_used = True
+                    _load_token_cache()
+                    _load_wb_session()
+                    # Drop connection cookies associated with the old session.
+                    if session:
+                        session.close()
+                    session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE)
+                    item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
+                    if item.get("error") and (item.get("error_state") in access_errors or item.get("retry_after")):
+                        await asyncio.to_thread(wb_search_recovery.recover, item,
+                                                _wb_session.get("saved_at", 0), allow_refresh=False)
+                if item.get("error"):
+                    item.update(wb_search_recovery.cooldown_error(wb_search_recovery.session_generation()) or {})
 
             if item.get("error"):
                 blocked_error = item
-
-        result[kw] = {
-            "promo_pos": item["promo_pos"],
-            "organic_pos": item["organic_pos"],
-            "is_advertised": item["is_advertised"],
-            "preset_id": item.get("preset_id"),
-            "tokens": item.get("tokens") or [],
-            "error": item.get("error", False),
-            "error_state": item.get("error_state"),
-            "status_code": item.get("status_code"),
-            "error_message": item.get("error_message") or "",
-        }
-        logger.info(
-            "Positions for %d '%s': promo=%s organic=%s is_ad=%s%s",
-            article, kw, item["promo_pos"], item["organic_pos"], item["is_advertised"],
-            " ERROR" if item.get("error") else "",
-        )
-        if blocked_error:
-            break
-
-    # Close session
-    if session:
-        session.close()
+            result[kw] = {
+                "promo_pos": item["promo_pos"], "organic_pos": item["organic_pos"],
+                "is_advertised": item["is_advertised"], "preset_id": item.get("preset_id"),
+                "tokens": item.get("tokens") or [], "error": item.get("error", False),
+                "error_state": item.get("error_state"), "status_code": item.get("status_code"),
+                "error_message": item.get("error_message") or "",
+                "retry_after": item.get("retry_after", 0),
+                "recovery_reason": item.get("recovery_reason"),
+            }
+            logger.info(
+                "Positions for %d '%s': promo=%s organic=%s is_ad=%s%s",
+                article, kw, item["promo_pos"], item["organic_pos"], item["is_advertised"],
+                " ERROR" if item.get("error") else "",
+            )
+    finally:
+        if session:
+            session.close()
 
     # Fill missing keywords
     for kw in keywords:
@@ -496,6 +512,8 @@ async def get_positions(article: int, keywords: list[str],
                 "error_state": (blocked_error or {}).get("error_state"),
                 "status_code": (blocked_error or {}).get("status_code"),
                 "error_message": (blocked_error or {}).get("error_message") or "",
+                "retry_after": (blocked_error or {}).get("retry_after", 0),
+                "recovery_reason": (blocked_error or {}).get("recovery_reason"),
             }
 
     return result
