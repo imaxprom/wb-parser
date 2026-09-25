@@ -87,7 +87,8 @@ class SessionMonitorTest(unittest.TestCase):
         cookies.assert_called_once_with()
 
     def test_full_probe_checks_all_four_pages_and_extracts_positions(self):
-        response = SimpleNamespace(status_code=200, json=lambda: {"products": [{"id": 123}]})
+        secret = "private-response-cookie"
+        response = SimpleNamespace(status_code=200, json=lambda: {"products": [{"id": 123}]}, text=secret, cookies={"x_wbaas_token": secret}, headers={"Set-Cookie": secret})
         with patch.object(monitor.positions.curl_requests, "Session") as session, patch.object(monitor.positions, "_build_headers", return_value={}):
             client = session.return_value.__enter__.return_value
             client.get.return_value = response
@@ -95,6 +96,8 @@ class SessionMonitorTest(unittest.TestCase):
         self.assertEqual(result["state"], "healthy")
         self.assertIsNotNone(result["promo_pos"])
         self.assertIsNotNone(result["organic_pos"])
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(result["responses"][0]["cookie_names_received"], ["x_wbaas_token"])
         self.assertEqual([(r["page"], r["variant"]) for r in result["responses"]],
                          [("1", "normal"), ("2", "normal"), ("1", "no_promo"), ("2", "no_promo")])
 

@@ -92,9 +92,19 @@ def full_probe(sku=0):
                 responses.append(item)
                 response = client.get(*args, **kwargs)
                 item["status"] = response.status_code
-                retry = getattr(response, "headers", {}).get("Retry-After", "")
+                response_headers = getattr(response, "headers", {})
+                retry = response_headers.get("Retry-After", "")
                 item["retry_after"] = int(retry) if retry.isdigit() else 0
-                item["antibot"] = is_antibot_response(response.status_code, getattr(response, "text", "")[:2000])
+                body = getattr(response, "text", "")
+                item["antibot"] = is_antibot_response(response.status_code, body[:2000])
+                # Values of Set-Cookie, auth headers and response bodies must
+                # never enter the observation log; names/flags are sufficient.
+                item["cookie_names_received"] = sorted(getattr(response, "cookies", {}).keys())
+                item["content_type"] = response_headers.get("Content-Type", "")
+                item["body_length"] = len(body)
+                if response.status_code != 200:
+                    item["body_markers"] = [word for word in ("captcha", "token", "expired", "invalid", "limit", "подозрительная", "токен", "лимит") if word in body.lower()]
+                    item["rate_limit_headers"] = {key: int(response_headers[key]) for key in ("X-Ratelimit-Limit", "X-Ratelimit-Reset", "X-Ratelimit-Retry") if str(response_headers.get(key, "")).isdigit()}
                 try:
                     item["products"] = len(response.json().get("products", []))
                 except (ValueError, AttributeError, TypeError):
@@ -294,13 +304,13 @@ def report(directory, state):
              f"Контроль: один замер каждые {state['interval']} секунд, с паузами при отказах.",
              "Используется сохранённый покупательский аккаунт на production, текущий поисковый endpoint и фиксированный запрос.",
              f"Ответы контрольного поиска: {dict(counts)}. Попыток обновления: {len(recoveries)}.",
-             f"Полный цикл рабочего парсера включается через {state.get('full_after_hours', 2)} ч от начала; контрольный SKU: {state.get('sku', 0)}. В этом режиме один замер содержит до четырёх последовательных HTTP-запросов.",
+             f"Контрольный SKU: {state.get('sku', 0)}. Режимы замеров: {dict(Counter(e['result'].get('mode', 'single_page') for e in probes))}. Полный цикл содержит до четырёх последовательных HTTP-запросов; переходы между этапами записаны в events.jsonl.",
              "", "## Хронология отказов и восстановления", ""]
     for event in events:
         if event["event"] == "refresh" or (event["event"] in ("probe", "verification") and event["result"]["state"] != "healthy"):
             lines.append(f"- {stamp(event['at'])}: {event['event']}: {json.dumps(event['result'], ensure_ascii=False)}; возраст сохранённой сессии: {event.get('session', {}).get('age_seconds')} сек.")
     lines += ["", "## Ограничения выводов", "",
-              "HTTP 498 относится к антибот-отказам; сам по себе он не доказывает истечение Bearer или фиксированный срок жизни сессии.",
+              "В коде HTTP 498 классифицируется как антибот-отказ; сам по себе он не доказывает истечение Bearer или фиксированный срок жизни сессии.",
               "Время отказа находится между последним успешным и первым неуспешным замером. При cooldown этот интервал шире пяти минут.",
               "Первый цикл начинается с ранее созданной сессии; её возраст не равен длительности наблюдения.",
               "Обновление меняет несколько компонентов сразу. Совпадение восстановления с обновлением не определяет единственный виновный токен.",
