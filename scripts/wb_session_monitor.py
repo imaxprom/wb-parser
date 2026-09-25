@@ -373,7 +373,12 @@ def run(directory, hours, interval, full_after_hours=2, sku=0):
             emit(directory, "probe", result=result, session=metadata)
             # After a cooldown, test the old session first: distinguish natural
             # recovery from recovery caused by renewing the saved login.
-            if result["state"] in ("antibot", "auth_expired") and (state["recover_pending"] or result["state"] == "auth_expired") and state["end_at"] - time.time() > 180:
+            can_renew = result["state"] == "auth_expired" or (
+                result["state"] == "antibot"
+                and not result.get("retry_after")
+                and (state["recover_pending"] or state.get("immediate_refresh", False))
+            )
+            if can_renew and state["end_at"] - time.time() > 180:
                 renewal = refresh_subprocess()
                 emit(directory, "refresh", result=renewal, session=session_metadata(), previous_session=metadata)
                 if renewal["state"] == "refreshed":

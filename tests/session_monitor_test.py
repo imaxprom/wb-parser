@@ -80,6 +80,17 @@ class SessionMonitorTest(unittest.TestCase):
         self.assertTrue(state["recover_pending"])
         self.assertEqual(state["next_at"], 2300)
 
+    def test_fast_recovery_policy_renews_once_and_verifies(self):
+        renew, state = self._cycle({"recover_pending": False, "failures": 0, "immediate_refresh": True}, [{"state": "antibot"}, {"state": "healthy"}], {"state": "refreshed"})
+        renew.assert_called_once_with()
+        self.assertEqual(state["failures"], 0)
+        self.assertEqual(state["next_at"], 800)
+
+    def test_retry_after_prevents_fast_recovery_even_when_already_pending(self):
+        renew, state = self._cycle({"immediate_refresh": True, "failures": 0}, {"state": "antibot", "retry_after": 2400})
+        renew.assert_not_called()
+        self.assertEqual(state["next_at"], 2900)
+
     def test_existing_auth_cache_is_reloaded_at_batch_boundary(self):
         with patch.object(proxy_positions, "_wb_session", {"saved_at": 1}), patch.object(proxy_positions, "_token_cache", {"__direct__": {}}), patch.object(proxy_positions, "_load_wb_session") as session, patch.object(proxy_positions, "_load_token_cache") as cookies, patch.object(proxy_positions.curl_requests, "Session"), patch.object(proxy_positions.config, "WB_PROXIES", []):
             asyncio.run(proxy_positions.get_positions(1, []))
