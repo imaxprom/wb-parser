@@ -104,6 +104,38 @@ class SearchRecoveryTest(unittest.TestCase):
         self.session.write_text(json.dumps({"saved_at": 2}))
         self.assertIsNone(recovery.cooldown_error(2))
 
+    def test_single_phone_screen_gets_short_pause_then_recovery_can_succeed(self):
+        phone = {"state": "login_required", "reason": "phone_or_sms_required",
+                 "diagnostics": {"phone_stable_seconds": 76}}
+        with patch.object(recovery.time, "time", return_value=100000), \
+                patch.object(recovery, "_refresh", return_value=phone):
+            self.assertFalse(recovery.recover(BLOCKED, 1))
+            error = recovery.cooldown_error(1)
+            self.assertEqual(error["recovery_reason"], "login_unconfirmed")
+            self.assertEqual(error["retry_after"], 900)
+            self.assertNotIn("Обновить WB-сессию", bot._evirma_error_notice([{"a": {**error, "error": True}}]))
+        with patch.object(recovery.time, "time", return_value=100901), \
+                patch.object(recovery, "_refresh", side_effect=self.renewed):
+            self.assertTrue(recovery.recover(BLOCKED, 1))
+            self.assertIsNone(recovery.cooldown_error(2))
+            self.assertNotIn("login_required_checks", recovery._read(recovery._state_path()))
+
+    def test_two_persistent_phone_screens_confirm_manual_login(self):
+        phone = {"state": "login_required", "reason": "phone_or_sms_required"}
+        with patch.object(recovery.time, "time", return_value=100000), patch.object(recovery, "_refresh", return_value=phone):
+            self.assertFalse(recovery.recover(BLOCKED, 1))
+        with patch.object(recovery.time, "time", return_value=100901), patch.object(recovery, "_refresh", return_value=phone):
+            self.assertFalse(recovery.recover(BLOCKED, 1))
+            error = recovery.cooldown_error(1)
+            self.assertEqual(error["recovery_reason"], "login_required")
+            self.assertEqual(error["retry_after"], 21600)
+            self.assertEqual(recovery._read(recovery._state_path())["login_required_checks"], 2)
+
+    def test_missing_saved_login_does_not_get_speculative_retry(self):
+        with patch.object(recovery, "_refresh", return_value={"state": "login_required", "reason": "no_saved_wbid"}):
+            self.assertFalse(recovery.recover(BLOCKED, 1))
+        self.assertEqual(recovery.cooldown_error(1)["recovery_reason"], "login_required")
+
     def test_concurrent_recovery_uses_one_browser(self):
         def renew_slowly():
             time.sleep(0.03)

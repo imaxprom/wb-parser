@@ -4,13 +4,55 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import proxy_positions
 from scripts import wb_session_monitor as monitor
 
 
 class SessionMonitorTest(unittest.TestCase):
+    def _login_window(self, phone_visible, token_ready, action_ready=lambda t: False):
+        clock = [0]
+        page = Mock()
+        page.url = "https://www.wildberries.ru/"
+        page.evaluate.return_value = {}
+        page.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
+        page.locator.return_value.first.is_visible.side_effect = lambda: phone_visible(clock[0])
+        context = Mock()
+        context.cookies.return_value = []
+        bot = Mock()
+        bot._wb_context_has_auth_tokens.side_effect = lambda *a: (token_ready(clock[0]), {})
+        button = Mock()
+        bot._wb_saved_login_action.side_effect = lambda *a, **kw: ("account", button) if action_ready(clock[0]) and not kw["account_selected"] else None
+        save = Mock()
+        with patch.object(monitor.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(monitor.positions, "_wb_session", {}), patch.object(monitor.positions, "_token_cache", {}), \
+                patch.object(monitor, "probe", return_value={"state": "healthy", "status": 200}) as probe, \
+                patch.object(monitor, "atomic_json"):
+            result = monitor._resume_context(context, page, bot, save, Path("unused"))
+        return result, save, probe, clock[0]
+
+    def test_phone_form_before_account_chooser_does_not_abort_login(self):
+        result, save, probe, elapsed = self._login_window(lambda t: t < 12, lambda t: t >= 16, lambda t: t >= 12)
+        self.assertEqual(result["state"], "refreshed")
+        self.assertEqual(elapsed, 16)
+        save.assert_called_once()
+        probe.assert_called_once_with(reload=False)
+
+    def test_stable_phone_form_observes_entire_window_without_saving(self):
+        result, save, probe, elapsed = self._login_window(lambda t: True, lambda t: False)
+        self.assertEqual(result["state"], "login_required")
+        self.assertGreaterEqual(elapsed, 75)
+        self.assertGreaterEqual(result["diagnostics"]["phone_stable_seconds"], 75)
+        save.assert_not_called()
+        probe.assert_not_called()
+
+    def test_phone_form_at_end_of_window_is_not_confirmed_login_requirement(self):
+        result, save, probe, _ = self._login_window(lambda t: t >= 70, lambda t: False)
+        self.assertEqual(result["state"], "refresh_blocked")
+        self.assertLess(result["diagnostics"]["phone_stable_seconds"], 20)
+        save.assert_not_called()
+
     def test_html_challenge_with_200_is_not_success(self):
         response = SimpleNamespace(status_code=200, headers={}, text="Подозрительная активность")
         with patch.object(monitor.positions.curl_requests, "get", return_value=response), patch.object(monitor.positions, "_build_headers", return_value={}):

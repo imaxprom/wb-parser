@@ -139,5 +139,20 @@ def recover(error, observed_generation, *, allow_refresh=True):
         failed["retry_after"] = max(failed.get("retry_after") or 0, verification.get("retry_after") or 0)
         if verification.get("state") == "rate_limited":
             failed["error_state"] = "rate_limited"
-        _defer(state, failed, session_generation(), reason=renewal.get("state", "refresh_error"))
+        reason = renewal.get("state", "refresh_error")
+        state["last_login_reason"] = renewal.get("reason")
+        state["last_login_diagnostics"] = renewal.get("diagnostics", {})
+        if reason == "login_required" and renewal.get("reason") == "phone_or_sms_required":
+            # One fresh browser seeing a phone form is not enough to infer a
+            # revoked WB.ID login. Confirm in a second attempt after backoff.
+            same_session = state.get("session_saved_at") == session_generation()
+            previous_check = state.get("last_result") in ("login_unconfirmed", "login_required")
+            checks = state.get("login_required_checks", 0) if same_session and previous_check else 0
+            state["login_required_checks"] = checks + 1
+            if checks == 0:
+                reason = "login_unconfirmed"
+                failed["error_state"] = "auth_expired"
+        else:
+            state["login_required_checks"] = 0
+        _defer(state, failed, session_generation(), reason=reason)
         return False

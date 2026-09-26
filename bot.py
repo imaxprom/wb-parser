@@ -1958,6 +1958,9 @@ def _evirma_error_notice(position_sets: list[dict]) -> str:
     recovery_reasons = {item.get("recovery_reason") for item in errors}
     if "login_required" in recovery_reasons:
         notice += " WB запросил подтверждение входа. Используйте «Обновить WB-сессию» в меню."
+    elif "login_unconfirmed" in recovery_reasons:
+        retry_after = max((item.get("retry_after") or 0 for item in errors), default=0)
+        notice += f" Сохранённый вход пока не восстановился. Повторная попытка доступна через {(retry_after + 59) // 60} мин."
     elif "login_in_progress" in recovery_reasons:
         notice += " Обновление сессии уже выполняется; повторите проверку немного позже."
     else:

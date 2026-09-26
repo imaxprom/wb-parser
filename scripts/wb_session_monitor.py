@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -165,6 +166,51 @@ def probe(*, reload=True, full=False, sku=0):
                 "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
 
+def _resume_context(ctx, page, bot, save_session, directory):
+    """Wait through redirects before deciding that the saved login needs input."""
+    account_selected = consent_accepted = False
+    started = time.monotonic()
+    phone_since = None
+    phone_observations = 0
+    while time.monotonic() - started < 75:
+        has_tokens, _ = bot._wb_context_has_auth_tokens(ctx, page)
+        if has_tokens and urlsplit(page.url).hostname in ("wildberries.ru", "www.wildberries.ru"):
+            cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+            storage = page.evaluate("() => Object.fromEntries(Object.entries(localStorage))")
+            positions._wb_session = {"cookies": cookies, "localStorage": storage}
+            positions._token_cache = {}
+            verification = probe(reload=False)
+            if verification["state"] != "healthy":
+                return {"state": "candidate_rejected", "verification": verification}
+            save_session(ctx, page)
+            atomic_json(directory / "wb_login_working_state.json", ctx.storage_state())
+            return {"state": "refreshed", "verification": verification}
+        action = bot._wb_saved_login_action(page, account_selected=account_selected,
+                                           consent_accepted=consent_accepted)
+        phone = page.locator('input[name="phoneNumber"]:not([type="radio"]), input[data-test-id="field_phone_input"], input#wb-phone-number').first.is_visible()
+        if action:
+            name, button = action
+            button.click(timeout=10000)
+            account_selected |= name == "account"
+            consent_accepted |= name == "consent"
+            phone_since = None
+        elif phone:
+            phone_observations += 1
+            if phone_since is None:
+                phone_since = time.monotonic()
+        else:
+            phone_since = None
+        # A phone form can appear before the asynchronous account chooser.
+        # Observe the entire resume window; never submit a phone/SMS here.
+        page.wait_for_timeout(2000)
+    details = {"account_selected": account_selected, "consent_accepted": consent_accepted,
+               "phone_observations": phone_observations,
+               "phone_stable_seconds": round(time.monotonic() - phone_since, 1) if phone_since is not None else 0}
+    if details["phone_stable_seconds"] >= 20:
+        return {"state": "login_required", "reason": "phone_or_sms_required", "diagnostics": details}
+    return {"state": "refresh_blocked", "reason": "browser_did_not_resume", "diagnostics": details}
+
+
 def resume_login():
     """Resume an already authorized WB.ID account, validate before publishing."""
     # Reuse the same helpers as the proven interactive flow, without its SMS
@@ -201,32 +247,7 @@ def resume_login():
                     page.goto("https://www.wildberries.ru/", timeout=30000, wait_until="domcontentloaded")
                     page.wait_for_timeout(3000)
                     page.goto("https://www.wildberries.ru/security/login", timeout=30000, wait_until="domcontentloaded")
-                    account_selected = consent_accepted = False
-                    deadline = time.monotonic() + 75
-                    while time.monotonic() < deadline:
-                        has_tokens, _ = bot._wb_context_has_auth_tokens(ctx, page)
-                        if has_tokens and "wildberries.ru" in page.url:
-                            cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-                            storage = page.evaluate("() => Object.fromEntries(Object.entries(localStorage))")
-                            positions._wb_session = {"cookies": cookies, "localStorage": storage}
-                            positions._token_cache = {}
-                            verification = probe(reload=False)
-                            if verification["state"] != "healthy":
-                                return {"state": "candidate_rejected", "verification": verification}
-                            _save_session(ctx, page)
-                            atomic_json(directory / "wb_login_working_state.json", ctx.storage_state())
-                            return {"state": "refreshed", "verification": verification}
-                        action = bot._wb_saved_login_action(page, account_selected=account_selected,
-                                                           consent_accepted=consent_accepted)
-                        if action:
-                            name, button = action
-                            button.click(timeout=10000)
-                            account_selected |= name == "account"
-                            consent_accepted |= name == "consent"
-                        elif page.locator('input[name="phoneNumber"]:not([type="radio"]), input[data-test-id="field_phone_input"], input#wb-phone-number').first.is_visible():
-                            return {"state": "login_required", "reason": "phone_or_sms_required"}
-                        page.wait_for_timeout(2000)
-                    return {"state": "refresh_blocked", "reason": "browser_did_not_resume"}
+                    return _resume_context(ctx, page, bot, _save_session, directory)
                 finally:
                     browser.close()
         finally:
