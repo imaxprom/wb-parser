@@ -197,6 +197,28 @@ class SearchRecoveryTest(unittest.TestCase):
         refresh.assert_not_called()
         self.assertGreater(result["b"]["retry_after"], 3590)
 
+    def test_pause_audit_correlates_http_response_without_secrets(self):
+        response = SimpleNamespace(status_code=429, headers={"Retry-After": "1200"})
+        with patch.object(positions.curl_requests, "get", return_value=response):
+            _, error = positions._search_sync({}, {})
+        error["error_message"] = "private-error-text"
+        with patch.object(recovery, "_refresh") as refresh:
+            self.assertFalse(recovery.recover(error, 1))
+        refresh.assert_not_called()
+        raw = (self.directory / "wb_search_recovery_events.jsonl").read_text()
+        event = json.loads(raw.splitlines()[-1])
+        self.assertEqual(event["response_id"], error["response_id"])
+        self.assertEqual(event["request_source"], "search_http")
+        self.assertEqual(event["pause_origin"], "retry_after")
+        self.assertEqual(event["server_retry_after_seconds"], 1200)
+        self.assertNotIn("private-error-text", raw)
+
+    def test_unspecified_call_is_not_logged_as_observed_http(self):
+        recovery.recover({**BLOCKED, "status_code": 429, "error_state": "rate_limited"}, 1)
+        event = json.loads((self.directory / "wb_search_recovery_events.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(event["request_source"], "unspecified")
+        self.assertEqual(event["pause_origin"], "local_rate_limit_backoff")
+
 
 if __name__ == "__main__":
     unittest.main()

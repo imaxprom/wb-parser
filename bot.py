@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.types import (
@@ -1714,6 +1715,17 @@ def _save_evirma_positions(uid: int, article: dict, queries: list, positions: di
         )
 
 
+def _position_pause_notifier(chat_id: int, msg_id: int, sku: str):
+    async def notify(retry_at: float):
+        until = datetime.fromtimestamp(retry_at, ZoneInfo("Europe/Moscow")).strftime("%H:%M:%S %d.%m")
+        await bot.edit_message_text(
+            f"⏳ Проверка {sku} временно приостановлена до {until} МСК.\n"
+            "Продолжу автоматически с незавершённых запросов. Повторно нажимать кнопку не нужно.",
+            chat_id=chat_id, message_id=msg_id,
+        )
+    return notify
+
+
 async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, queries: list):
     """Background task: get evirma positions for one article via queue."""
     try:
@@ -1742,7 +1754,8 @@ async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, que
             )
 
         start = time.time()
-        future = await position_queue.submit(uid, nm_id, keywords, label=sku)
+        future = await position_queue.submit(uid, nm_id, keywords, label=sku,
+                                             on_pause=_position_pause_notifier(chat_id, msg_id, sku))
         positions = await future
         elapsed = time.time() - start
 
@@ -1823,6 +1836,7 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
                 int(sku),
                 keywords,
                 label=sku,
+                on_pause=_position_pause_notifier(chat_id, msg_id, sku),
             )
             positions = await future
             all_position_sets.append(positions)
@@ -1955,6 +1969,8 @@ def _evirma_error_notice(position_sets: list[dict]) -> str:
     else:
         reason = "WB не вернул полные данные"
     notice = f"\n⚠️ {len(errors)} запросов не выполнены: {reason} (HTTP {status_text})."
+    if any(item.get("automatic_retries_exhausted") for item in errors):
+        notice += " Автоматические повторы этой проверки завершены после повторных отказов."
     recovery_reasons = {item.get("recovery_reason") for item in errors}
     if "login_required" in recovery_reasons:
         notice += " WB запросил подтверждение входа. Используйте «Обновить WB-сессию» в меню."
@@ -3198,6 +3214,8 @@ def reschedule_parser():
         trigger=IntervalTrigger(minutes=interval),
         id="auto_parse",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     logger.info(f"Scheduler set to {interval} min interval")
 

@@ -38,6 +38,18 @@ def _save(state):
     temporary.write_text(json.dumps(state))
     os.chmod(temporary, 0o600)
     os.replace(temporary, path)
+    # A separate append-only metadata journal also covers subprocess/CLI users
+    # whose stdout is not captured by the bot's systemd journal.
+    fields = ("session_saved_at", "retry_at", "last_result", "status_code", "failures",
+              "last_refresh_at", "pause_origin", "request_source", "response_id",
+              "server_retry_after_seconds", "last_login_reason")
+    event = {"at": time.time(), "pid": os.getpid(), **{key: state[key] for key in fields if key in state}}
+    try:
+        fd = os.open(path.with_name("wb_search_recovery_events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as log:
+            log.write(json.dumps(event) + "\n")
+    except OSError as exc:
+        logger.error("WB recovery audit append failed: %s", type(exc).__name__)
 
 
 def cooldown_error(generation):
@@ -51,6 +63,7 @@ def cooldown_error(generation):
         return None
     return {"error_state": state.get("error_state", "antibot"),
             "status_code": state.get("status_code"), "retry_after": remaining,
+            "retry_at": state.get("retry_at"), "retry_session_saved_at": state.get("session_saved_at"),
             "recovery_reason": state.get("last_result"),
             "error_message": state.get("error_message", "WB session recovery is pending")}
 
@@ -71,6 +84,13 @@ def _defer(previous, error, generation, *, reason="rejected", minimum=0):
              "status_code": error.get("status_code"), "error_message": message,
              "server_delay": bool(requested or error.get("error_state") == "rate_limited"),
              "last_result": reason}
+    source = error.get("request_source")
+    state["request_source"] = source if source in ("search_http", "recovery_verification") else "unspecified"
+    response_id = error.get("response_id", "")
+    state["response_id"] = response_id if isinstance(response_id, str) and len(response_id) == 32 and all(c in "0123456789abcdef" for c in response_id) else None
+    state["server_retry_after_seconds"] = requested
+    state["pause_origin"] = ("retry_after" if requested else "local_rate_limit_backoff"
+                             if error.get("error_state") == "rate_limited" else "local_recovery_backoff")
     _save(state)
     logger.warning("WB search recovery deferred: reason=%s delay=%ss", reason, delay)
 
@@ -139,6 +159,10 @@ def recover(error, observed_generation, *, allow_refresh=True):
         failed["retry_after"] = max(failed.get("retry_after") or 0, verification.get("retry_after") or 0)
         if verification.get("state") == "rate_limited":
             failed["error_state"] = "rate_limited"
+        if verification:
+            failed["request_source"] = "recovery_verification"
+            failed["status_code"] = verification.get("status")
+            failed.pop("response_id", None)
         reason = renewal.get("state", "refresh_error")
         state["last_login_reason"] = renewal.get("reason")
         state["last_login_diagnostics"] = renewal.get("diagnostics", {})

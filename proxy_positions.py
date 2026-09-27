@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Optional
 
 from curl_cffi import requests as curl_requests
@@ -203,17 +204,20 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
 
         client = session if session else curl_requests
         resp = client.get(SEARCH_URL, **kwargs)
+        response_id = uuid.uuid4().hex if resp.status_code != 200 else None
+        retry_after = retry_after_seconds(getattr(resp, "headers", {}).get("Retry-After"))
         logger.info(
-            "WB search response: status=%s elapsed_ms=%d session_saved_at=%s",
+            "WB search response: status=%s elapsed_ms=%d session_saved_at=%s response_id=%s retry_after=%s",
             resp.status_code, int((time.monotonic() - started) * 1000),
-            _wb_session.get("saved_at", 0),
+            _wb_session.get("saved_at", 0), response_id, retry_after,
         )
         if resp.status_code == 200:
             return resp.json(), None
-        retry_after = retry_after_seconds(getattr(resp, "headers", {}).get("Retry-After"))
+        evidence = {"request_source": "search_http", "response_id": response_id}
         if resp.status_code in RATE_LIMIT_HTTP_STATUSES:
             logger.warning("429 rate limit")
             return {}, {
+                **evidence,
                 "error_state": "rate_limited",
                 "retry_after": retry_after,
                 "status_code": resp.status_code,
@@ -222,6 +226,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         if resp.status_code in ANTIBOT_HTTP_STATUSES:
             logger.warning("%d anti-bot block", resp.status_code)
             return {}, {
+                **evidence,
                 "error_state": "antibot",
                 "retry_after": retry_after,
                 "status_code": resp.status_code,
@@ -230,6 +235,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         if resp.status_code in AUTH_HTTP_STATUSES:
             logger.warning("%d expired WB session", resp.status_code)
             return {}, {
+                **evidence,
                 "error_state": "auth_expired",
                 "retry_after": retry_after,
                 "status_code": resp.status_code,
@@ -237,6 +243,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
             }
         logger.warning("HTTP %d from WB", resp.status_code)
         return {}, {
+            **evidence,
             "error_state": "network_error",
             "retry_after": retry_after,
             "status_code": resp.status_code,
@@ -488,6 +495,8 @@ async def get_positions(article: int, keywords: list[str],
                 "error_state": item.get("error_state"), "status_code": item.get("status_code"),
                 "error_message": item.get("error_message") or "",
                 "retry_after": item.get("retry_after", 0),
+                "retry_at": item.get("retry_at"),
+                "retry_session_saved_at": item.get("retry_session_saved_at"),
                 "recovery_reason": item.get("recovery_reason"),
             }
             logger.info(
@@ -513,6 +522,8 @@ async def get_positions(article: int, keywords: list[str],
                 "status_code": (blocked_error or {}).get("status_code"),
                 "error_message": (blocked_error or {}).get("error_message") or "",
                 "retry_after": (blocked_error or {}).get("retry_after", 0),
+                "retry_at": (blocked_error or {}).get("retry_at"),
+                "retry_session_saved_at": (blocked_error or {}).get("retry_session_saved_at"),
                 "recovery_reason": (blocked_error or {}).get("recovery_reason"),
             }
 
