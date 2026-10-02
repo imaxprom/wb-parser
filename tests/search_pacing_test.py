@@ -1,8 +1,10 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import multiprocessing
 from pathlib import Path
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -65,6 +67,54 @@ class SearchPacingTest(unittest.TestCase):
             with pacing.request_slot(): starts.append(time.time())
         self.assertGreaterEqual(starts[1] - starts[0], .009)
         self.assertGreaterEqual(starts[2] - starts[1], .049)
+
+    def test_client_profiles_propagate_to_request_threads_and_expire_independently(self):
+        self.configure(gap_ms=50, profiles={
+            "bot": {"name": "bot_batch", "batch_size": 4, "batch_pause_ms": 5000},
+            "benchmark": {"name": "expired", "gap_ms": 0, "experiment": True, "expires_at": 1}})
+        async def check():
+            with pacing.client_scope("bot"):
+                return await asyncio.to_thread(pacing.policy)
+        bot = asyncio.run(check())
+        self.assertEqual((bot["scope"],bot["batch_size"],bot["gap_ms"]),("bot",4,50))
+        with pacing.client_scope("benchmark"):
+            self.assertEqual(pacing.policy()["gap_ms"],1500)
+        with pacing.client_scope("rpc"):
+            self.assertEqual(pacing.policy()["gap_ms"],50)
+            self.assertFalse(pacing.policy()["experiment"])
+
+    def test_rpc_between_bot_requests_does_not_reset_bot_batch_count(self):
+        self.configure(profiles={"bot": {"name": "batch", "batch_size": 2, "batch_pause_ms": 80}})
+        with pacing.client_scope("bot"):
+            with pacing.request_slot(): pass
+            with pacing.request_slot(): last_bot = time.time()
+        with pacing.client_scope("rpc"):
+            with pacing.request_slot(): rpc_at = time.time()
+        with pacing.client_scope("bot"):
+            with pacing.request_slot(): next_bot = time.time()
+        self.assertLess(rpc_at-last_bot,.06)
+        self.assertGreaterEqual(next_bot-last_bot,.075)
+        state=json.loads((self.directory/'wb_search_pacing_state.json').read_text())
+        self.assertEqual(state['clients']['bot']['count'],3)
+        self.assertEqual(state['clients']['rpc']['count'],1)
+
+    def test_bot_wait_releases_global_slot_for_rpc(self):
+        self.configure(profiles={"bot": {"name": "slow_bot", "gap_ms": 300}})
+        first = threading.Event()
+        def bot():
+            with pacing.client_scope('bot'):
+                with pacing.request_slot(): start=time.time()
+                first.set()
+                with pacing.request_slot(): return start,time.time()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future=pool.submit(bot)
+            self.assertTrue(first.wait(2))
+            time.sleep(.03)
+            with pacing.client_scope('rpc'):
+                with pacing.request_slot(): rpc_at=time.time()
+            start,finish=future.result(timeout=3)
+        self.assertLess(rpc_at-start,.2)
+        self.assertGreaterEqual(finish-rpc_at,.29)
 
     def test_existing_pause_blocks_network_and_is_not_extended(self):
         recovery._save({"session_saved_at": 1, "failures": 1, "retry_at": time.time() + 60,
