@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 import fcntl
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,52 @@ def client_name():
         return _client.get()
     program = Path(getattr(sys.modules.get("__main__"), "__file__", "interactive")).name
     return {"bot.py": "bot", "positions_rpc.py": "rpc"}.get(program, "default")
+
+
+def _priority_file():
+    path = Path(config.DATA_DIR) / "wb_search_bot_priority.lock"
+    return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "a+")
+
+
+def reserve_bot_priority():
+    """Reserve across requests; process exit also releases the reservation."""
+    if client_name() != "bot":
+        return None
+    handle = _priority_file()
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        return handle
+    except BaseException:
+        handle.close()
+        raise
+
+
+def bot_priority_active():
+    with _priority_file() as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+@contextmanager
+def bot_priority():
+    handle = reserve_bot_priority()
+    try:
+        yield
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+def bot_priority_job(function):
+    """Keep priority across all articles and awaits of one Telegram check."""
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        with client_scope("bot"), bot_priority():
+            return await function(*args, **kwargs)
+    return wrapped
 
 
 def _read(path):
@@ -81,15 +128,18 @@ class SearchPaused(Exception):
 
 @contextmanager
 def request_slot():
-    if policy() is None:
-        yield None
-        return
     directory = Path(config.DATA_DIR)
     with (directory / "wb_search_request.lock").open("a+") as lock:
         from wb_search_recovery import cooldown_error, session_generation
         state_path = directory / "wb_search_pacing_state.json"
         while True:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if client_name() != "bot" and bot_priority_active():
+                # The already admitted HTTP request may finish. No later
+                # website request starts until all bot reservations finish.
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                time.sleep(.05)
+                continue
             state = _read(state_path)
             pause = cooldown_error(session_generation())
             if pause:

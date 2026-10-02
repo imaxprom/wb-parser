@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import queue_worker as queues
 import wb_search_recovery as recovery
+import wb_search_pacing as pacing
 
 
 OK = {"error": False, "promo_pos": 12, "organic_pos": 14, "is_advertised": False}
@@ -52,6 +53,41 @@ class QueueRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(calls[1][0] - deadline, .2)
         self.assertTrue(all(not r["error"] for r in result.values()))
         callback.assert_awaited_once_with(deadline)
+
+    async def test_bot_priority_survives_cancelled_waiter_until_queued_work_finishes(self):
+        started,release=asyncio.Event(),asyncio.Event()
+        async def fetch(*args):
+            self.assertEqual(pacing.client_name(),'bot')
+            started.set();await release.wait()
+            return {'a':OK}
+        with patch.object(queues._positions_module,'get_positions',side_effect=fetch):
+            with pacing.client_scope('bot'):
+                first=await self.queue.submit(1,123,['a'])
+                second=await self.queue.submit(1,123,['a'])
+            await started.wait()
+            first.cancel()
+            self.assertTrue(pacing.bot_priority_active())
+            release.set();await second
+        self.assertFalse(pacing.bot_priority_active())
+
+    async def test_queue_shutdown_releases_pending_priority_reservations(self):
+        started=asyncio.Event()
+        async def fetch(*args):
+            started.set();await asyncio.sleep(100)
+        with patch.object(queues._positions_module,'get_positions',side_effect=fetch):
+            with pacing.client_scope('bot'):
+                first=await self.queue.submit(1,123,['a'])
+                second=await self.queue.submit(2,456,['a'])
+            await started.wait()
+            self.assertTrue(pacing.bot_priority_active())
+            self.queue._worker_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):await self.queue._worker_task
+            self.queue._worker_task=None
+            await self.queue.stop()
+            await asyncio.sleep(0)  # shielded subscriber receives cancellation on the next loop turn
+            self.assertTrue(first.cancelled() or first.done())
+            self.assertTrue(second.cancelled() or second.done())
+        self.assertFalse(pacing.bot_priority_active())
 
     async def test_same_pending_article_shares_work_and_cancellation_is_isolated(self):
         started, release = asyncio.Event(), asyncio.Event()

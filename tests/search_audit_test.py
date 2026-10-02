@@ -54,7 +54,12 @@ class SearchAuditTest(unittest.TestCase):
         self.assertNotIn("private", json.dumps(self.events()))
 
     def test_audit_disk_failure_does_not_turn_successful_search_into_error(self):
-        with patch.object(audit.os, "open", side_effect=OSError("private-path")):
+        real_open = audit.os.open
+        def fail_audit_only(path, *args, **kwargs):
+            if Path(path).suffix == '.jsonl':
+                raise OSError("private-path")
+            return real_open(path, *args, **kwargs)
+        with patch.object(audit.os, "open", side_effect=fail_audit_only):
             data, error = self.request(SimpleNamespace(status_code=200, headers={}, json=lambda: {"ok": True}))
         self.assertIsNone(error)
         self.assertEqual(data, {"ok": True})

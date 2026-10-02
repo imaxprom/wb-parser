@@ -6,10 +6,12 @@ Only one article is checked at a time, with a short pause between articles.
 import asyncio
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from collections import defaultdict
 
 import config
+import wb_search_pacing
 import wb_search_recovery
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,7 @@ class Task:
     label: str = ""  # e.g. SKU for logging
     pause_callbacks: list = field(default_factory=list)
     retry_at: float = 0
+    priority_handle: object = field(default=None, repr=False)
 
 
 class PositionQueue:
@@ -76,6 +79,7 @@ class PositionQueue:
                 self._worker_task.cancel()
             self._worker_task = None
         for task in self._tasks.values():
+            self._release_priority(task)
             if not task.future.done():
                 task.future.cancel()
         self._tasks.clear()
@@ -91,7 +95,8 @@ class PositionQueue:
             task = self._tasks.get(key)
             if task is None or task.future.done():
                 task = Task(uid=uid, nm_id=nm_id, keywords=list(keywords),
-                            future=loop.create_future(), label=label or str(nm_id))
+                            future=loop.create_future(), label=label or str(nm_id),
+                            priority_handle=wb_search_pacing.reserve_bot_priority())
                 self._tasks[key] = task
                 self._user_queues[uid].append(task)
             if on_pause is not None:
@@ -176,6 +181,12 @@ class PositionQueue:
         """Total pending tasks across all users."""
         return sum(len(q) for q in self._user_queues.values())
 
+    @staticmethod
+    def _release_priority(task):
+        if task.priority_handle is not None:
+            task.priority_handle.close()
+            task.priority_handle = None
+
     def pending_for_user(self, uid: int) -> int:
         """Pending tasks for a specific user."""
         return len(self._user_queues.get(uid, []))
@@ -244,7 +255,9 @@ class PositionQueue:
                 task.uid, task.label, len(task.keywords), self.pending_count
             )
             try:
-                result = await self._execute(task)
+                context = wb_search_pacing.client_scope("bot") if task.priority_handle is not None else nullcontext()
+                with context:
+                    result = await self._execute(task)
                 if not task.future.cancelled():
                     task.future.set_result(result)
                 logger.info("Done: %s (%.1fs since submit)",
@@ -258,6 +271,7 @@ class PositionQueue:
                 if not task.future.cancelled():
                     task.future.set_exception(e)
             finally:
+                self._release_priority(task)
                 self._tasks.pop((task.uid, task.nm_id, tuple(task.keywords)), None)
                 if not task.future.done():
                     task.future.cancel()

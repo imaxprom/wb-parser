@@ -33,6 +33,7 @@ import parser
 import charts
 import alerts
 import xlsx_loader
+from wb_search_pacing import bot_priority_job
 from wb_health import (
     ANTIBOT_HTTP_STATUSES,
     RATE_LIMIT_HTTP_STATUSES,
@@ -1726,6 +1727,7 @@ def _position_pause_notifier(chat_id: int, msg_id: int, sku: str):
     return notify
 
 
+@bot_priority_job
 async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, queries: list):
     """Background task: get evirma positions for one article via queue."""
     try:
@@ -1782,6 +1784,7 @@ async def _do_evirma_one(uid: int, chat_id: int, msg_id: int, article: dict, que
             pass
 
 
+@bot_priority_job
 async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
     """Background task: evirma positions for all articles via queue."""
     try:
@@ -3116,6 +3119,7 @@ def _format_shelf_results(sku: str, competitors: list, results: dict,
 
 # --- Scheduler ---
 
+@bot_priority_job
 async def scheduled_parse():
     """Auto-parse only articles that users explicitly enabled."""
     logger.info("Scheduled auto-parse started")
