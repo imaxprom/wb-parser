@@ -219,6 +219,67 @@ class SearchRecoveryTest(unittest.TestCase):
         self.assertEqual(event["request_source"], "unspecified")
         self.assertEqual(event["pause_origin"], "local_rate_limit_backoff")
 
+    def test_rate_limit_retries_one_request_then_backs_off_without_login(self):
+        response = SimpleNamespace(status_code=429, headers={})
+        with patch.object(positions.curl_requests, "Session") as client, \
+                patch.object(recovery, "_refresh") as refresh:
+            client.return_value.get.return_value = response
+            for now, delay in [(100000, 300), (100300, 600), (100900, 1200)]:
+                with patch.object(recovery.time, "time", return_value=now):
+                    client.return_value.get.reset_mock()
+                    result = asyncio.run(positions.get_positions(123, ["a", "b"]))
+                    client.return_value.get.assert_called_once()
+                    self.assertEqual(result["a"]["retry_after"], delay)
+                    self.assertTrue(result["b"]["error"])
+                    asyncio.run(positions.get_positions(123, ["a"]))
+                    client.return_value.get.assert_called_once()
+            refresh.assert_not_called()
+
+    def test_successful_keyword_resets_rate_backoff_and_preserves_refresh_time(self):
+        rate = {**BLOCKED, "error_state": "rate_limited", "status_code": 429}
+        with patch.object(recovery.time, "time", return_value=100000):
+            recovery._save({"session_saved_at": 1, "last_refresh_at": 99000})
+            recovery.recover(rate, 1)
+        with patch.object(recovery.time, "time", return_value=100301), \
+                patch.object(positions, "_fetch_keyword_sync", side_effect=[OK, dict(rate)]), \
+                patch.object(positions.curl_requests, "Session"):
+            result = asyncio.run(positions.get_positions(123, ["a", "b"]))
+        self.assertFalse(result["a"]["error"])
+        self.assertEqual(result["b"]["retry_after"], 300)
+        state = recovery._read(recovery._state_path())
+        self.assertEqual(state["failures"], 1)
+        self.assertEqual(state["last_refresh_at"], 99000)
+        events = [json.loads(l) for l in (self.directory / "wb_search_recovery_events.jsonl").read_text().splitlines()]
+        self.assertIn("search_healthy", [e.get("last_result") for e in events])
+
+    def test_success_cannot_clear_active_or_newer_pause_or_replaced_session(self):
+        state = {"session_saved_at": 1, "failures": 2, "retry_at": 1100, "server_delay": True}
+        recovery._save(state)
+        with patch.object(recovery.time, "time", return_value=1200):
+            # This request started before the pause, though it finished later.
+            self.assertFalse(recovery.record_success(1, started_at=999))
+        with patch.object(recovery.time, "time", return_value=1050):
+            self.assertFalse(recovery.record_success(1, started_at=1050))
+        self.session.write_text(json.dumps({"saved_at": 2}))
+        self.assertFalse(recovery.record_success(1, started_at=1200))
+        self.assertEqual(recovery._read(recovery._state_path()), state)
+        self.assertTrue(recovery.record_success(2, started_at=1200))
+        self.assertEqual(recovery._read(recovery._state_path())["failures"], 0)
+
+    def test_failed_keyword_does_not_reset_backoff(self):
+        recovery._save({"session_saved_at": 1, "failures": 2, "retry_at": 1})
+        with patch.object(positions, "_fetch_keyword_sync", return_value={**BLOCKED, "error_state": "invalid_response"}), \
+                patch.object(positions.curl_requests, "Session"):
+            asyncio.run(positions.get_positions(123, ["a"]))
+        self.assertEqual(recovery._read(recovery._state_path())["failures"], 2)
+
+    def test_success_does_not_wait_for_running_recovery(self):
+        recovery._save({"session_saved_at": 1, "failures": 1, "retry_at": 0})
+        with (self.directory / "wb_search_recovery.lock").open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            self.assertFalse(recovery.record_success(1, time.time()))
+        self.assertTrue(recovery.record_success(1, time.time()))
+
 
 if __name__ == "__main__":
     unittest.main()

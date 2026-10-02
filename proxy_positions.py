@@ -462,6 +462,7 @@ async def get_positions(article: int, keywords: list[str],
             if blocked_error:
                 break
             generation = _wb_session.get("saved_at", 0)
+            started_at = time.time()
             item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
             if item.get("error") and item.get("error_state") in (None, "network_error") and not item.get("retry_after"):
                 await asyncio.sleep(0.5)
@@ -475,6 +476,8 @@ async def get_positions(article: int, keywords: list[str],
                     recovery_used = True
                     _load_token_cache()
                     _load_wb_session()
+                    generation = _wb_session.get("saved_at", 0)
+                    started_at = time.time()
                     # Drop connection cookies associated with the old session.
                     if session:
                         session.close()
@@ -488,6 +491,8 @@ async def get_positions(article: int, keywords: list[str],
 
             if item.get("error"):
                 blocked_error = item
+            else:
+                await asyncio.to_thread(wb_search_recovery.record_success, generation, started_at)
             result[kw] = {
                 "promo_pos": item["promo_pos"], "organic_pos": item["organic_pos"],
                 "is_advertised": item["is_advertised"], "preset_id": item.get("preset_id"),

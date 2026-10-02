@@ -15,6 +15,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
+RATE_LIMIT_INITIAL_DELAY = 300
+
 
 def _read(path):
     try:
@@ -68,10 +70,36 @@ def cooldown_error(generation):
             "error_message": state.get("error_message", "WB session recovery is pending")}
 
 
+def record_success(generation, started_at):
+    """Reset backoff after a complete keyword fetched after the last pause.
+
+    A concurrent request that started before a newer failure must not clear its
+    pause, even if that request finishes after the deadline. Old-session results
+    cannot acknowledge recovery of a replacement session either.
+    """
+    if not _read(_state_path()).get("failures"):
+        return False
+    with (Path(config.DATA_DIR) / "wb_search_recovery.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        state = _read(_state_path())
+        if (not state.get("failures") or session_generation() != generation
+                or state.get("retry_at", 0) > started_at):
+            return False
+        _save({"session_saved_at": generation, "failures": 0, "retry_at": 0,
+               "last_refresh_at": state.get("last_refresh_at", 0),
+               "last_result": "search_healthy", "status_code": 200})
+        logger.info("WB search recovered without login; failure backoff reset")
+        return True
+
+
 def _defer(previous, error, generation, *, reason="rejected", minimum=0):
     failures = (previous.get("failures", 0) if previous.get("session_saved_at") == generation else 0) + 1
     requested = error.get("retry_after") or 0
-    delay = max(minimum, requested, min(900 * 2 ** min(failures - 1, 3), 7200))
+    initial = RATE_LIMIT_INITIAL_DELAY if error.get("error_state") == "rate_limited" else 900
+    delay = max(minimum, requested, min(initial * 2 ** min(failures - 1, 5), 7200))
     if previous.get("server_delay"):
         delay = max(delay, previous.get("retry_at", 0) - time.time())
     message = "WB временно недоступен; автоматическая повторная проверка разрешена после паузы."
