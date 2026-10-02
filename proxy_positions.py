@@ -22,6 +22,7 @@ from curl_cffi import requests as curl_requests
 import config
 import wb_search_recovery
 import wb_search_audit
+import wb_search_pacing
 from wb_health import (
     ANTIBOT_HTTP_STATUSES,
     AUTH_HTTP_STATUSES,
@@ -191,6 +192,22 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
 
 def _search_sync(headers: dict, params: dict, proxy_url: str = None,
                  session: curl_requests.Session = None) -> tuple[dict, dict | None]:
+    try:
+        with wb_search_pacing.request_slot() as pacing:
+            data, error = _search_unpaced_sync(headers, params, proxy_url, session, pacing=pacing)
+            # Publish a rate/server pause before releasing the shared request
+            # slot, so a waiting process cannot send the next request first.
+            if pacing and error and (error.get("error_state") == "rate_limited" or error.get("retry_after")):
+                wb_search_recovery.recover(error, _wb_session.get("saved_at", 0), allow_refresh=False)
+                error.update(wb_search_recovery.cooldown_error(wb_search_recovery.session_generation()) or {})
+                error["pause_registered"] = True
+            return data, error
+    except wb_search_pacing.SearchPaused as exc:
+        return {}, exc.error
+
+
+def _search_unpaced_sync(headers: dict, params: dict, proxy_url: str = None,
+                         session: curl_requests.Session = None, *, pacing=None) -> tuple[dict, dict | None]:
     """Single search request. Returns (data, classified_error)."""
     started = time.monotonic()
     started_at = time.time()
@@ -212,7 +229,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         wb_search_audit.record(started_at=started_at, elapsed_ms=int((time.monotonic() - started) * 1000),
                                status=resp.status_code, generation=_wb_session.get("saved_at", 0),
                                response_id=response_id, retry_after=retry_after,
-                               params=params, has_proxy=bool(proxy_url))
+                               params=params, has_proxy=bool(proxy_url), pacing=pacing)
         response_recorded = True
         logger.info(
             "WB search response: status=%s elapsed_ms=%d session_saved_at=%s response_id=%s retry_after=%s",
@@ -261,7 +278,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         if not response_recorded:
             wb_search_audit.record(started_at=started_at, elapsed_ms=int((time.monotonic() - started) * 1000),
                                    status=None, generation=_wb_session.get("saved_at", 0),
-                                   response_id=None, retry_after=0, params=params, has_proxy=bool(proxy_url))
+                                   response_id=None, retry_after=0, params=params, has_proxy=bool(proxy_url), pacing=pacing)
         logger.error("Request error: %s", e)
         return {}, {
             "error_state": "network_error",

@@ -44,7 +44,7 @@ def _save(state):
     # whose stdout is not captured by the bot's systemd journal.
     fields = ("session_saved_at", "retry_at", "last_result", "status_code", "failures",
               "last_refresh_at", "pause_origin", "request_source", "response_id",
-              "server_retry_after_seconds", "last_login_reason")
+              "server_retry_after_seconds", "last_login_reason", "experiment_stage", "experiment_429_count")
     event = {"at": time.time(), "pid": os.getpid(), **{key: state[key] for key in fields if key in state}}
     try:
         fd = os.open(path.with_name("wb_search_recovery_events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -90,6 +90,7 @@ def record_success(generation, started_at):
             return False
         _save({"session_saved_at": generation, "failures": 0, "retry_at": 0,
                "last_refresh_at": state.get("last_refresh_at", 0),
+               **{k: state[k] for k in ("experiment_stage", "experiment_429_count") if k in state},
                "last_result": "search_healthy", "status_code": 200})
         logger.info("WB search recovered without login; failure backoff reset")
         return True
@@ -100,6 +101,13 @@ def _defer(previous, error, generation, *, reason="rejected", minimum=0):
     requested = error.get("retry_after") or 0
     initial = RATE_LIMIT_INITIAL_DELAY if error.get("error_state") == "rate_limited" else 900
     delay = max(minimum, requested, min(initial * 2 ** min(failures - 1, 5), 7200))
+    if error.get("error_state") == "rate_limited":
+        from wb_search_pacing import policy
+        pacing = policy()
+        if pacing and pacing["experiment"]:
+            checks = previous.get("experiment_429_count", 0) if previous.get("experiment_stage") == pacing["name"] else 0
+            previous = {**previous, "experiment_stage": pacing["name"], "experiment_429_count": checks + 1}
+            delay = max(minimum, requested, (60, 120, 300)[min(checks, 2)])
     if previous.get("server_delay"):
         delay = max(delay, previous.get("retry_at", 0) - time.time())
     message = "WB временно недоступен; автоматическая повторная проверка разрешена после паузы."
@@ -135,6 +143,8 @@ def recover(error, observed_generation, *, allow_refresh=True):
     A process lock coalesces concurrent failures. A persisted cooldown survives
     service restarts and prevents each queued article from opening a browser.
     """
+    if error.get("local_pause") or error.get("pause_registered"):
+        return False  # No new HTTP failure: do not extend an existing pause.
     directory = Path(config.DATA_DIR)
     with (directory / "wb_search_recovery.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
