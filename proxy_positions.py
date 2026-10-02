@@ -21,6 +21,7 @@ from curl_cffi import requests as curl_requests
 
 import config
 import wb_search_recovery
+import wb_search_audit
 from wb_health import (
     ANTIBOT_HTTP_STATUSES,
     AUTH_HTTP_STATUSES,
@@ -192,6 +193,8 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
                  session: curl_requests.Session = None) -> tuple[dict, dict | None]:
     """Single search request. Returns (data, classified_error)."""
     started = time.monotonic()
+    started_at = time.time()
+    response_recorded = False
     try:
         kwargs = {
             "params": params,
@@ -206,6 +209,11 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
         resp = client.get(SEARCH_URL, **kwargs)
         response_id = uuid.uuid4().hex if resp.status_code != 200 else None
         retry_after = retry_after_seconds(getattr(resp, "headers", {}).get("Retry-After"))
+        wb_search_audit.record(started_at=started_at, elapsed_ms=int((time.monotonic() - started) * 1000),
+                               status=resp.status_code, generation=_wb_session.get("saved_at", 0),
+                               response_id=response_id, retry_after=retry_after,
+                               params=params, has_proxy=bool(proxy_url))
+        response_recorded = True
         logger.info(
             "WB search response: status=%s elapsed_ms=%d session_saved_at=%s response_id=%s retry_after=%s",
             resp.status_code, int((time.monotonic() - started) * 1000),
@@ -250,6 +258,10 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
             "error_message": f"WB search returned HTTP {resp.status_code}",
         }
     except Exception as e:
+        if not response_recorded:
+            wb_search_audit.record(started_at=started_at, elapsed_ms=int((time.monotonic() - started) * 1000),
+                                   status=None, generation=_wb_session.get("saved_at", 0),
+                                   response_id=None, retry_after=0, params=params, has_proxy=bool(proxy_url))
         logger.error("Request error: %s", e)
         return {}, {
             "error_state": "network_error",

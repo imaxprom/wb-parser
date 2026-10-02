@@ -110,7 +110,8 @@ class WbHealthTest(unittest.TestCase):
         session = Mock()
         session.get.return_value = SimpleNamespace(status_code=401)
 
-        data, error = proxy_positions._search_sync({}, {}, session=session)
+        with patch.object(proxy_positions.wb_search_audit, "record"):
+            data, error = proxy_positions._search_sync({}, {}, session=session)
 
         self.assertEqual(data, {})
         self.assertEqual(error["error_state"], "auth_expired")
