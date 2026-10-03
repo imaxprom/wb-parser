@@ -1,61 +1,52 @@
 # Правила работы с проектом WB Parser
 
-Last verified: 2026-09-09 23:23 MSK.
+Сверено 3 октября 2026. Изменяемые runtime-факты: `SESSION_STATE.md`.
 
 ## Изоляция и безопасность
 
-- Работай с кодом только в `/Users/octopus/Projects/wb-parser/`, кроме явно запрошенного пользователем обновления памяти Codex.
-- Чтение и редактирование SQLite внутри проекта разрешено.
+- Работай с кодом в `/Users/octopus/Projects/wb-parser/`, кроме явно запрошенного
+  обновления памяти Codex. Чтение/редактирование SQLite проекта разрешено;
+  при диагностике предпочитай read-only соединения и агрегаты без персональных данных.
 - Не устанавливай внешние пакеты без согласования.
-- Не печатай, не коммить и не записывай в документацию значения `.env`, cookies, session JSON, токены, пароли, API-ключи, прокси-учётные данные, worker secrets и database URLs.
-- Существующие незакоммиченные изменения принадлежат пользователю. Сейчас таким изменением является `deploy/wb-cart-stock-worker.service`; сохраняй его отдельно от несвязанных задач.
+- Не печатай и не сохраняй в Git/документы значения .env, cookies, session/browser
+  state, токены, пароли, ключи, proxy credentials, worker secrets и строки подключения БД.
+- Production `deploy.sh` содержит чувствительные значения: его можно запускать по
+  workflow, но нельзя выводить целиком в инструменты/отчёты.
+- Существующие изменения принадлежат пользователю. Сохраняй отдельно
+  `deploy/wb-cart-stock-worker.service`; не включай в несвязанные коммиты.
+- Untracked operational wrapper, deploy-файлы и backups на VPS не удалять самовольно.
 
-## Архитектура
+## Среды и workflow
 
-- Mac `/Users/octopus/Projects/wb-parser`: разработка.
-- GitHub `imaxprom/wb-parser`, ветка `main`: источник версий.
-- VPS по alias `ssh wb-parser`, путь `~/wb-parser`: production.
-- Production-ветка называется `master`, но deploy fast-forward’ит её из `origin/main`.
-- Python 3.13 локально, Python 3.12 на VPS, aiogram 3, curl_cffi, aiohttp, APScheduler, Playwright и SQLite.
+- Local Mac: разработка; GitHub `imaxprom/wb-parser`, `main`: источник версий.
+- Production: `ssh wb-parser`, `~/wb-parser`, ветка `master`, deploy из `origin/main`.
+- Сервисы `wb-parser.service` и `wb-cart-stock-worker.service`.
+- После изменения кода: релевантные тесты → scoped commit → `git push` →
+  `ssh wb-parser "~/wb-parser/deploy.sh"` → статусы и свежие безопасные логи.
+- Полный набор: `./venv/bin/python -m unittest discover -s tests -p '*_test.py'`.
+- Изменения только документации можно пушить и синхронизировать на VPS без рестарта.
+- Не переносить локальную .env/БД/runtime-конфигурацию на production.
 
-## Обязательный порядок после изменения кода
+## Инварианты диагностики
 
-1. Изменить код локально через аккуратный patch.
-2. Запустить релевантные тесты; полный набор: `./venv/bin/python -m unittest discover -s tests -p '*_test.py'`.
-3. Коммитить только относящиеся к задаче файлы и выполнить `git push`.
-4. Выполнить `ssh wb-parser "~/wb-parser/deploy.sh"`.
-5. Проверить статусы и свежие логи `wb-parser.service`; для worker-задач также `wb-cart-stock-worker.service`.
+- Сначала читай `SESSION_STATE.md`, `PROJECT_CONTEXT.md`, `TODO.md`, затем сверяй
+  изменяемые утверждения по коду и runtime. Время в отчётах — МСК; HTTP-файлы датированы UTC.
+- Число HTTP-запросов, полных проверок ключа и уникальных фраз — разные метрики.
+  В обычном поиске четыре HTTP на ключ без повторов; HTTP 200 не гарантирует полноту.
+- Пауза pacing отсчитывается после ответа. Telegram приоритетен на всю проверку;
+  общий HTTP-lock и cooldown остаются обязательными для всех обычных клиентов.
+- 429 не считать основанием для смены сессии. Локальное ожидание не новый HTTP-отказ.
+  Не снимать cooldown ради ускорения и не выдавать временную экспериментальную
+  политику за постоянную. Детали: `WB_SESSION_RECOVERY.md`.
+- `wb_search_pacing.json` вне Git. Исторический benchmark восстанавливает batch4;
+  актуальная выбранная пользователем политика — оба клиента serial50.
+- Geo, полки и cart-stock проверять отдельно от обычного поиска. Их прежний успех
+  не доказывает текущее здоровье. Geo-глубину/регионы не менять без задачи.
+- Главное меню Telegram — persistent ReplyKeyboard, разделы используют inline UI.
 
-Документные context-only изменения можно пушить без перезапуска production-сервиса.
+## Память
 
-## Текущий runtime
-
-- Проверенный код: `4f18b6e Load WB session before geo scan`.
-- `wb-parser.service` и `wb-cart-stock-worker.service` активны.
-- Основной парсер: `proxy_positions.py`, production работает напрямую без WB-прокси.
-- Рабочий search endpoint: `https://search.wb.ru/exactmatch/ru/common/v18/search`.
-- Geo использует этот же endpoint, действующую сессию и 8 прежних регионов; production-проверка успешна.
-- Shelf scanner пока использует заблокированный `www/__internal/recom` endpoint. Проверенный, но ещё не внедрённый адрес: `https://recom.wb.ru/recom/ru/common/v8/search`.
-- Полная локальная тестовая проверка: 24 теста.
-
-## Авторизация WB
-
-- Авторизация запускается владельцем через Telegram: телефон, затем шестизначный код.
-- Используется headed Chromium в Xvfb, а не headless login.
-- Рабочее промежуточное WB.ID-состояние отделено от активной session.
-- Resume-путь выбирает сохранённый аккаунт и принимает OAuth-согласие.
-- Новая session проверяется реальным search-запросом; scheduler пропускает цикл, пока идёт интерактивная авторизация.
-
-## UI и нагрузка
-
-- Главное Telegram-меню — постоянная ReplyKeyboard; inline-кнопки управляют содержимым разделов.
-- Обычный поиск идёт через последовательную общую очередь и не делает отдельный preflight.
-- Автопроверка включена только для 2 товаров владельца (12 ключей) раз в 20 минут; другие пользователи scheduled-нагрузку не создают.
-- Geo оставлен в прежней схеме по просьбе пользователя; возможное сокращение глубины и улучшение отображения ошибок — отдельная задача.
-
-## Состояние и память
-
-- Перед продолжением читай `SESSION_STATE.md`, `PROJECT_CONTEXT.md`, `TODO.md` и эту инструкцию.
-- `npm run save-session-state` недоступен: в Python-проекте нет `package.json`.
-- `KnowledgeBase.tsx` отсутствует, React UI в репозитории нет.
-- Production содержит untracked operational files/backups; не удалять без явного разрешения.
+Контекст сохраняется вручную в Markdown и, по запросу, в
+`~/.codex/memories/wb-parser-current-context.md`. `npm run save-session-state`
+недоступен: это Python-проект без `package.json`. `KnowledgeBase.tsx` отсутствует.
+Исторические отчёты хранить с датой и не смешивать с текущим снимком.

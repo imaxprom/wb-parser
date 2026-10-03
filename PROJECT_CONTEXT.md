@@ -1,83 +1,73 @@
-# WB Parser Project Context
+# WB Parser — контекст проекта
 
-Last verified: 2026-09-09 23:23 MSK.
+Сверено с кодом 3 октября 2026. Актуальные числа, состояние сервисов и результаты
+экспериментов находятся в `SESSION_STATE.md`; дальнейшие задачи — в `TODO.md`.
 
-## Purpose and stack
+## Назначение и состав
 
-WB Parser is a Python Telegram bot for tracking Wildberries product positions, regional search positions, recommendation shelves, charts, alerts, and scheduled checks. It also contains an authorized cart-stock worker used by MpHub.
+Python Telegram-бот: позиции товаров Wildberries, региональная выдача, полки
+рекомендаций, графики, уведомления и плановые проверки. Отдельный cart-stock worker
+обслуживает MpHub. Внешний сайт вызывает поисковые функции на том же VPS.
+Стек: aiogram 3, aiohttp, curl_cffi, APScheduler, Playwright, SQLite, matplotlib, openpyxl.
 
-- Python 3.13 locally and 3.12 on production.
-- `aiogram`, `aiohttp`, `curl_cffi`, `APScheduler`, `playwright`, SQLite, matplotlib, and openpyxl.
-- Local repository: `/Users/octopus/Projects/wb-parser`.
-- Production: host alias `wb-parser`, application path `~/wb-parser`.
-- Repository: `imaxprom/wb-parser`, development branch `main`.
+- `bot.py`: Telegram, persistent ReplyKeyboard главного меню, inline-разделы,
+  планировщик и интерактивная авторизация WB.
+- `proxy_positions.py`: основной поиск; перечитывание сессии на границе пакета,
+  обычные страницы 1/2 и no_promo страницы 1/2 на ключ.
+- `queue_worker.py`: последовательная очередь, справедливость по пользователям,
+  объединение одинаковых ожидающих задач, продолжение незавершённых ключей после паузы.
+- `wb_search_pacing.py`: общий HTTP-lock, клиентские профили задержек, резервы
+  приоритета Telegram на всё задание. Сайт ждёт после текущего HTTP.
+- `wb_search_recovery.py`: общий cooldown, ограниченное возобновление WB.ID,
+  аудит решений. `wb_search_audit.py`: метаданные каждого обычного HTTP-запроса.
+- `parser.py`: Geo (8 регионов, прежняя глубина до 5 страниц), полки и legacy helpers.
+- `db.py`: глобальная allow-list/token БД и отдельные SQLite пользователей.
+- `wb_health.py`: состояния доступности по scope; старый default health не заменяет
+  свежие recovery/HTTP-аудиты обычного поиска.
+- `cart_stock_worker.py`, `wb_session_runtime.py`: cart-stock, браузерная сессия,
+  SQLite outbox. Этот поток имеет собственную политику доступности.
+- `scripts/wb_session_monitor.py`: браузерное восстановление и исторический наблюдатель;
+  `scripts/wb_pacing_experiment.py`, `wb_bot_pacing_benchmark.py`: экспериментальные
+  контроллеры. Их финальные настройки не следует считать текущей production-политикой.
+- Production `positions_rpc.py` — внешний operational wrapper, **untracked**.
+  Другие клиенты могут исполнять Python через stdin (`interactive` в HTTP-аудите).
 
-## Main components
+## Запросы и авторизация
 
-- `bot.py`: Telegram handlers, persistent menu, scheduling, result formatting, and interactive WB authorization.
-- `proxy_positions.py`: active position parser and shared authenticated WB request headers.
-- `parser.py`: Geo scanner, recommendation shelf scanner, card/brand helpers, and legacy parser functions.
-- `queue_worker.py`: fair serialized queue for ordinary position scans.
-- `db.py`: global allow-list/token DB and per-user SQLite databases.
-- `wb_health.py`: scoped WB access classification and cooldown state.
-- `cart_stock_worker.py`: durable authorized cart-stock worker with SQLite outbox.
-- `wb_session_runtime.py`: browser/session runtime support for cart-stock access.
-- `scripts/wb_manual_auth_local.py`: manual local auth utility retained for diagnostics.
-- `chrome_positions.py` and `wb_login.py`: old/fallback implementations, not the primary production path.
+Обычный поиск и Geo используют `config.WB_SEARCH_URL`:
+`https://www.wildberries.ru/__internal/search/exactmatch/ru/common/v18/search`.
+Production ищет напрямую без WB-прокси. Обычный поиск не делает отдельный preflight.
+Runtime `data/wb_search_pacing.json` задаёт паузу после ответа, не период готовых ключей.
+Текущая политика обоих клиентов — 50 мс, без пачек; Telegram имеет приоритет.
+Один ключ обычно требует четырёх HTTP; счётчик HTTP не является счётчиком готовых фраз.
 
-## User interface
+401/403/498 в прямом обычном поиске запускают ограниченное восстановление сохранённого
+WB.ID, проверку кандидата до публикации и продолжение прерванной работы. 429 требуют
+ожидания, не повторного входа: база 300 с с ростом при последовательных отказах и
+соблюдением Retry-After. Успешный ключ сбрасывает счётчик. Подробности и ограничения
+очереди — в `WB_SESSION_RECOVERY.md`. Эти механизмы не распространяются автоматически
+на Geo, рекомендации, cart-stock и самостоятельные browser probe.
 
-- The main Telegram menu remains attached as a persistent reply keyboard.
-- Section content is rendered as inline messages; navigation edits the current bot content message where possible.
-- Ordinary search no longer performs a separate preflight request before the user-triggered parse.
-- Geo and shelf scans are initiated manually from their respective menu sections.
+Интерактивный вход владельца использует headed Chromium под Xvfb, телефон/код,
+выбор сохранённого аккаунта и OAuth. Промежуточное WB.ID отделено от активной сессии.
+Планировщик пропускает цикл во время интерактивной авторизации.
 
-## Wildberries request paths
+Полки всё ещё используют `www.wildberries.ru/__internal/recom/recom/ru/common/v8/search`.
+Альтернативный `recom.wb.ru` успешно проверялся 9 сентября, но сегодня не проверен.
+Нельзя описывать Geo/полки как исправленные по старому тесту. Автоматического обратного
+поиска полок и топов mkeeper в боте нет; исследование лежит в `data/research/mkeeper/`.
 
-### Main position search
+## Среды, данные и сопровождение
 
-- Working endpoint: `https://search.wb.ru/exactmatch/ru/common/v18/search`.
-- Production has no `WB_PROXY_*`; WB requests run directly from the VPS through `curl_cffi.Session` and are sequential.
-- Request state is derived from `data/wb_session.json` and includes current buyer auth/cookies and browser-like headers. Never print or document their values.
-- Direct mode intentionally omits `X-Pow` for the `__direct__` token key; this is current tested behavior.
-
-### Geo scanner
-
-- Uses the same working `search.wb.ru` host and current buyer session.
-- Keeps the 8 configured `dest` values and the previous five-page maximum.
-- A production test confirmed that authenticated requests still respect `dest` and produce different positions by city.
-- Geo lazily loads the persisted session, so it works immediately after bot restart.
-
-### Recommendation shelves
-
-- Current code is stale: it still uses `https://www.wildberries.ru/__internal/recom/recom/ru/common/v8/search`, which returns `498` from production.
-- Verified replacement: `https://recom.wb.ru/recom/ru/common/v8/search`, which returned `200` and valid products for all seven tested competitors.
-- This repair is intentionally still pending.
-
-## WB authorization
-
-- Owner starts auth in Telegram and sends a phone number and six-digit confirmation code.
-- Production opens headed Chromium inside a private Xvfb display.
-- Intermediate WB.ID state is saved separately from the active production session.
-- Resume logic retains useful WB.ID state while dropping failed anti-bot challenge cookies, selects an existing account, and accepts the OAuth consent screen.
-- A newly captured session is checked against a real search request before success is reported.
-- Scheduled position parsing skips while an interactive authorization job is active.
-
-## Runtime and deployment
-
-- Services: `wb-parser.service` and `wb-cart-stock-worker.service`.
-- Telegram API access on production uses a configured local proxy/tunnel; never print its credential-bearing configuration.
-- Cart-stock worker runs under Xvfb with its browser proxy and systemd watchdog in the installed production unit.
-- Standard code deployment: test locally, commit, push `main`, run `ssh wb-parser "~/wb-parser/deploy.sh"`, then inspect service logs.
-- Production Git branch is `master`; operational deployment files on the server are intentionally untracked.
-
-## Data and security
-
-- Runtime data is under `data/` and is gitignored.
-- User records live in `data/users/<user-folder>/user.db`; old aggregate tables remain in the global DB but are not the active per-user source of truth.
-- Never store or expose `.env` values, cookies, session JSON content, tokens, passwords, API keys, proxy credentials, worker secrets, or database URLs.
-- Existing unrelated working-tree changes belong to the user and must be preserved.
-
-## Session-state command
-
-This is not a Node project. `npm run save-session-state` currently fails because there is no root `package.json`; context is maintained manually in the Markdown files and Codex memory.
+- Разработка: `/Users/octopus/Projects/wb-parser`, GitHub `imaxprom/wb-parser`, `main`.
+- Production: `ssh wb-parser`, `~/wb-parser`, ветка `master`, deploy из `origin/main`.
+- Сервисы: `wb-parser.service`, `wb-cart-stock-worker.service`.
+- `data/parser.db` хранит глобальные сведения; актуальная история пользователей —
+  `data/users/<folder>/user.db`. Внешние запросы не обязаны писать историю бота.
+- `data/` игнорируется Git: включает runtime pacing/recovery, безопасные отчёты и
+  секретные сессии. Копировать можно только явно проверенные безопасные артефакты.
+- HTTP-аудит имеет UTC-имена файлов; показывать время пользователю в МСК.
+- Код: тесты → scoped commit → push → deploy → проверка runtime. Документация не
+  требует перезапуска сервисов. Правила безопасности и рабочие команды: `CLAUDE.md`.
+- npm-команды сохранения и `KnowledgeBase.tsx` отсутствуют; контекст ведётся вручную
+  в Markdown и `~/.codex/memories/wb-parser-current-context.md`.

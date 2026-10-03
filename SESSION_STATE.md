@@ -1,66 +1,168 @@
-# WB Parser Session State
+# WB Parser — состояние сессии
 
-Last verified: 2026-09-09 23:23 MSK.
+Проверено 3 октября 2026, 04:53–04:55 МСК. Это актуальный снимок; старые отчёты
+содержат состояние на момент своего эксперимента, а не текущие настройки.
 
-## Current state
+## Git, окружения и проверка
 
-- Verified application code is `4f18b6e Load WB session before geo scan`; newer commits are context-only. Local `main`, `origin/main`, and production should be kept at the same context HEAD without restarting services.
-- Production Git branch is named `master`; `~/wb-parser/deploy.sh` fast-forwards it from `origin/main`.
-- `wb-parser.service` and `wb-cart-stock-worker.service` are active with zero recorded restarts in their current runs.
-- Local worktree has one pre-existing user change: `deploy/wb-cart-stock-worker.service`. Do not overwrite or discard it. Its Xvfb/browser-proxy/watchdog settings match the currently installed production unit.
-- Production has untracked operational files and backups (`deploy.sh`, `positions_rpc.py`, `deploy-backups/`, `proxy_positions.py.bak-*`). Do not remove them without explicit approval.
+- При сверке local `main`, fetched `origin/main` и production `master` совпадали:
+  `e2b209281555d1b18268f9849229b660e472a2f2`. Следующий коммит сохранения контекста
+  меняет только документацию; версия исполняемого приложения остаётся `e2b2092`.
+- Production: `ssh wb-parser`, `~/wb-parser`. Оба сервиса `wb-parser.service` и
+  `wb-cart-stock-worker.service` active/running, NRestarts=0 в текущих запусках.
+  Бот запущен 02.10 в 21:16:09 МСК, worker — 01.10 в 11:17:30 МСК.
+- Локальный Python 3.13.12, production 3.12.3. Полный unittest: **98 тестов, OK**.
+- Существующее изменение `deploy/wb-cart-stock-worker.service` сохранено отдельно.
+  На сервере untracked `deploy.sh`, `positions_rpc.py`, `deploy-backups/` и старые
+  backup-файлы парсера; не удалять и не добавлять автоматически в Git.
+- `npm run save-session-state` выполнен, завершился ENOENT: `package.json` отсутствует.
+  Контекст сохранён вручную. `KnowledgeBase.tsx` и React UI в этом репозитории нет.
+- Безопасная сверка: `data/session-handoff-20261003/{local,production}.json`,
+  `audit.py`; тесты: `data/session-handoff-tests-20261003.log`.
+  Предыдущие документы и память сохранены в `data/session-handoff-20261003/before/`.
+  Всё под `data/` игнорируется Git. Значения секретов в снимки не включены.
 
-## Latest completed work
+## Реальная конфигурация поиска
 
-- The main Telegram menu is a persistent reply keyboard; content screens use inline navigation without removing the main menu.
-- Main WB position requests were simplified and use the working authenticated host `https://search.wb.ru/exactmatch/ru/common/v18/search`.
-- Classified WB failures such as auth expiry, anti-bot, and rate limiting are no longer blindly retried as bursts.
-- WB authorization now runs in headed Chromium under Xvfb, supports phone/code entry, resumes saved WB.ID state, selects the saved account, and accepts the WB.ID OAuth consent screen.
-- A fresh production WB session was saved on 2026-09-04. At verification it contained the required Bearer, PoW, and wbaas state; no values are stored here.
-- Geo scanner was restored in `65bf578` and `4f18b6e`: it now uses the working search host, current authenticated session, and loads that session itself after service restart.
-- Real production Geo verification returned positions in all 8 configured regions: `МСК 10`, `СПБ 7`, `КРД 7`, `КЗН 8`, `ЕКБ 6`, `НСК 6`, `ХБР 7`, `ВЛД 6` for the tested article/query.
+- Endpoint из `config.WB_SEARCH_URL`:
+  `https://www.wildberries.ru/__internal/search/exactmatch/ru/common/v18/search`.
+  Старый совет переключиться на `search.wb.ru` не является действующим решением.
+- На production **бот и сайт работают последовательно с паузой 50 мс после ответа**,
+  без паузы между пачками: `batch_size=1`, `batch_pause_ms=0`, `experiment=false`.
+  Корневой профиль `site_serial_50`, `profiles.bot.name=bot_serial_50`.
+  Источник — `data/wb_search_pacing.json`, перечитывается на каждом запросе, вне Git.
+  Бот переключён по прямому указанию пользователя 02.10 около 21:22 МСК.
+- Общий межпроцессный HTTP-lock допускает один обычный поисковый запрос одновременно.
+  **50 мс не означает 20 запросов или готовых фраз в секунду**: добавляется время ответа.
+- Telegram приоритетен на всю ручную/массовую/плановую проверку, включая промежутки
+  между товарами. Сайт завершает уже начатый HTTP, затем ждёт локально и продолжает
+  после освобождения последнего резерва бота, сохраняя уже полученные страницы.
+  ОС освобождает flock при падении процесса. Общий WB cooldown действует и на бота.
+- При 401/403/498 обычный прямой поиск пытается возобновить сохранённый WB.ID,
+  проверяет новую сессию, повторяет незавершённые ключи. Лимит browser-worker 160 с;
+  частота успешного повторного входа ограничена 15 минутами. Один экран телефона
+  больше не назначает сразу шестичасовую паузу; требуется подтверждение.
+- **429 не вызывает переавторизацию**. Штатная первая пауза 300 с, повторные отказы
+  увеличивают её до 120 минут; более длинный Retry-After соблюдается. Полная успешная
+  проверка ключа сбрасывает счётчик. Очередь возобновляется по retry_at, не ждёт
+  следующего 20-минутного цикла. Максимум три продолжения временно прерванной задачи.
+  Короткие паузы 60/120 с действовали только в завершённом эксперименте.
+- Резерв приоритета, pacing и эти повторы относятся к обычному поиску, не автоматически
+  ко всем Geo, полкам, корзине и браузерным probe. Подробности: `WB_SESSION_RECOVERY.md`.
 
-## Verification performed
+## Свежая нагрузка и БД
 
-- `npm run save-session-state` was attempted first and failed with `ENOENT` because this Python repository has no `package.json`.
-- Local test suite: 24 tests passed.
-- Production scheduled position scans after the Geo deploy continued returning real positions without global `401/498` failures.
-- Production bot logs after the latest restart contain no application exceptions.
-- Live endpoint diagnosis:
-  - `www.wildberries.ru/__internal/search/...` returns `498` from production.
-  - `search.wb.ru/exactmatch/...` returns `200` with products.
-  - `www.wildberries.ru/__internal/recom/...` returns `498`.
-  - `recom.wb.ru/recom/...` returns `200` with recommendation products.
+Production, окно **03.10 01:53:44–04:53:44 МСК**:
 
-## Data snapshot
+| Источник в HTTP-аудите | HTTP 200 | Ошибки HTTP/сети |
+|---|---:|---:|
+| positions_rpc.py | 904 | 0 |
+| bot.py | 1 080 | 0 |
+| interactive | 29 141 | 0 |
+| Итого | **31 125** | **0** |
 
-All counts are metadata only; no user content or credentials are recorded.
+Последний час: 11 913 ответов 200; последние 10 минут: 2 011 ответов 200.
+В журнале бота за три часа 9 стартов scheduler, 0 строк ERROR/traceback.
+`wb_search_recovery.json`: search_healthy, status=200, failures=0, cooldown=0.
+Это наблюдение указанного окна, не гарантия отсутствия будущих ограничений.
 
-- Local global DB: 4 allowed users, 2 legacy WB-token rows.
-- Local allowed-user DB totals: 8 articles, 57 queries, 14 competitors, 89,790 results.
-- Production global DB: 4 allowed users, 1 legacy WB-token row.
-- Production allowed-user DB totals: 9 articles, 59 queries, 21 competitors, 359,216 results.
-- Production has 2 auto-enabled articles and 12 auto keywords, all belonging to the owner. Other users currently contribute no scheduled WB load.
-- Production scheduler interval is 20 minutes. The current parser uses four WB page requests per keyword, so the auto workload is about 48 WB requests per cycle.
-- Cart-stock outbox is empty locally and on production.
+`interactive` — имя запуска без файла, не доказанный ID клиента/задачи. Память
+соседнего проекта `wb-ads-current-context.md` описывает постоянный SSH/NDJSON bridge
+с Python из stdin: это согласуется с ростом такого трафика, но конкретные HTTP не
+сопоставлены с его заданиями. Данные другого проекта в этой сессии не перепроверялись.
 
-## Environment summary
+| Данные | Production | Local |
+|---|---:|---:|
+| Разрешённые пользователи | 4 | 4 |
+| Товары | 11 | 8 |
+| Ключи | 71 | 57 |
+| Конкуренты | 21 | 14 |
+| Строки истории results | 377 579 | 89 790 |
+| Товары/ключи с auto_check | 5 / 30 | 4 / 24 |
+| Интервал владельца | 20 мин | 10 мин |
 
-- Local: Python 3.13.12, `PARSE_MODE=proxy`, 2 WB proxy entries configured, no Telegram proxy, no MpHub cart-stock connection.
-- Production: Python 3.12.3, `PARSE_MODE=proxy`, no WB proxies (direct WB access), Telegram proxy configured, MpHub cart-stock connection configured.
-- Production WB search health is `healthy`.
-- Cart-stock health file retains an old anti-bot state from 2026-09-08; the worker is active and idle, and reloads the WB session while waiting for work.
+История считается по пользовательским БД; внешние проверки не обязаны туда писать.
+Другие пользователи не имеют включённых auto-товаров. На production номинальный цикл:
+5 товаров × 6 ключей × 4 HTTP = 120 HTTP без повторов. Между товарами остаётся пауза 3 с.
+Все четыре пользовательские БД и cart-stock БД прошли read-only `quick_check` в обоих
+окружениях; глобальная production БД также OK. Outbox пуст в обоих окружениях.
+Production: прямой доступ WB (0 прокси), Telegram proxy и cart-stock настроены.
+Local: 2 WB-прокси, Telegram proxy/cart-stock не настроены, runtime pacing-файла нет;
+локальные данные не представляют production. Локальный бот в этой сессии не запускался.
+Пять свежих локальных записей HTTP (4×200, 1×498) созданы mock-тестами
+`tests/session_monitor_test.py`, не являются отказом production или реальными probe.
 
-## Unfinished
+Старый `wb_access_health.json` имеет отметку 23 августа: его healthy нельзя считать
+свежим сигналом поиска. Для поиска использованы recovery + текущий HTTP-аудит.
+Cart-stock health: healthy/200, последняя проверка 02.10 22:00:49 МСК;
+свежий реальный cart/Geo/shelf запрос при сохранении контекста не выполнялся.
 
-- Recommendation shelf scanner is not fixed yet. `parser.RECOM_URL` still points to the blocked `www/__internal/recom` address. A read-only production probe proved that changing only the host to `recom.wb.ru` returns valid shelf positions.
-- Geo still preserves its old request depth and presentation as requested. It can generate a large request batch when an article is absent, and it renders an HTTP failure as a normal dash.
-- There are no dedicated shelf behavior tests. Geo now has a regression test for endpoint, auth, lazy session loading, and position extraction.
-- `KnowledgeBase.tsx` does not exist because this repository has no React UI.
+## Как считать запросы и фразы
 
-## Next session start
+`get_positions` обычно делает **4 HTTP на один ключ**: страницы 1/2 обычной выдачи
+и 1/2 no_promo. Повторы, незавершённые ключи и разные товары меняют соотношение.
+HTTP 200 ещё не означает валидный JSON/полный результат. Ключ проверки также не
+равен уникальной фразе: одинаковая фраза может проверяться для разных товаров/повторно.
+Предыдущие 21 448 HTTP за три часа не означали 21 448 проверенных фраз.
+21 448 / 4 = 5 362 — лишь условный эквивалент без повторов и неполных проверок,
+**не измеренное число завершённых или уникальных ключей**. Общего точного счётчика
+завершённых ключей всех внешних клиентов сейчас нет.
 
-1. Read `SESSION_STATE.md`, `PROJECT_CONTEXT.md`, `TODO.md`, and `CLAUDE.md`.
-2. Run `git status --short` and preserve the existing service-unit change.
-3. Confirm local/origin/production HEAD and both production services.
-4. If asked to continue repairs, start with the minimal shelf-host replacement plus a regression test, then deploy and verify one real shelf scan.
+HTTP-аудит: `data/wb_search_requests/YYYY-MM-DD.jsonl`, дата файла UTC, отчёты МСК.
+Он покрывает `_search_sync`, но не весь сетевой трафик сервера. Источник, PID, статус,
+время и pacing доступны без записи поисковых фраз, заголовков или тела ответа.
+Локальное ожидание cooldown не считать новым HTTP-отказом.
+
+## Завершённые эксперименты и выводы
+
+- 12 часов 25 сентября: три 498 при возрасте сессии примерно 3ч41м, 1ч56м, 3ч45м;
+  фиксированный TTL/квота не установлены. WB.ID восстановил вход 3/3 без SMS.
+  `data/session-observation-20260925/final-report.md`.
+- Час 02.10 17:20–18:20: 2 229 HTTP, 7×429, 35 минут штатных пауз.
+  `data/hour-observation-20261002/RESULT.md`.
+- 90 активных минут 02.10 18:47–20:24, плюс 7 минут cooldown:
+  `data/pacing-experiment-20261002/RESULT.md`, `TABLE.md`, `DETAILS.md`.
+  4 726 HTTP в этапах, 6×429; ещё 24×200 между этапами.
+
+| Режим | HTTP 200 / 429 | Успешных HTTP / календарную минуту |
+|---|---:|---:|
+| 50 мс | 951 / 2 | 73,15 |
+| 100 мс | 489 / 1 | 44,45 |
+| 150 мс | 581 / 1 | 52,82 |
+| 200 мс | 602 / 1 | 54,73 |
+| 250 мс (два этапа) | 1 083 / 1 | 51,57 |
+| 750 мс | 333 / 0 | 33,30 |
+| 1 500 мс | 329 / 0 | 32,90 |
+| 4 HTTP / пауза 5 с | 352 / 0 | 35,20 |
+
+50 мс были быстрее пачек в 2,08 раза с учётом наблюдавшихся пауз. 429 случались
+при разных числах запросов; конкретный порог не установлен. Ограничения возникали
+и при последовательном HTTP. После назначенных 60/120 с фактический первый запрос
+приходился через 70,2–120 с и был успешен без смены сессии. Достаточность ровно 60 с
+не доказана. Нагрузка/история режима не были независимыми между этапами.
+
+- Полная очередь бота, ABBA, 5 товаров/30 ключей на попытку:
+  `data/bot-pacing-20261002/RESULT.md`. Пачки: среднее 250,53 с, serial50: 105,36 с;
+  ускорение **2,38 раза**, 30/30 ключей и 120×200 в каждой попытке, без 429.
+  Не измеряет доставку Telegram; получено до добавления приоритета.
+- Приоритет: `data/search-priority-20261002/RESULT.md`: 6/6 ключей, 24×200;
+  0 новых запросов сайта внутри резерва, сайт продолжил через 0,050 с после него.
+- Эти исторические отчёты фиксируют промежуточное решение оставить batch4.
+  Оно **заменено** последующим указанием пользователя включить 50 мс и для бота.
+  `scripts/wb_bot_pacing_benchmark.py` при повторном запуске всё ещё восстанавливает
+  batch4 по старому протоколу; не запускать поверх текущего режима без его пересмотра.
+- Эксперименты завершены; отдельное часовое/12-часовое наблюдение сейчас не запущено.
+  Постоянный аудит и восстановление работают как часть приложения.
+
+## Незавершённое и начало следующей сессии
+
+1. Прочитать этот снимок и `TODO.md`, затем снова проверить Git, службы, текущие
+   pacing/recovery и последние HTTP. Не выдавать этот снимок за состояние нового дня.
+2. Для следующего вопроса о числе проверенных фраз нужны метрики завершённых ключей,
+   повторов и источника/job ID; простого деления HTTP на четыре недостаточно.
+3. Geo/полки: свежего подтверждения работоспособности нет. Старый успешный probe
+   альтернативного recom-host от 9 сентября — исторический факт, не готовый актуальный fix.
+4. mkeeper: исследование сохранено в `data/research/mkeeper/ANALYSIS.ru.md`,
+   `reference.py`, `evidence.json`, `source/`. Клиент 1.28.15 получает обратные
+   рекомендации от `/api/wbstat/nm_similar/`; серверный сборщик не извлечён.
+   Автопоиск чужих карточек, история полок и топы не внедрены. Не повторять исследование.

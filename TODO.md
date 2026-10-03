@@ -1,26 +1,48 @@
-# WB Parser TODO
+# WB Parser — незавершённое
 
-Last verified: 2026-09-09 23:23 MSK.
+Сверено 3 октября 2026. Проверенные runtime-факты и замеры: `SESSION_STATE.md`.
 
-## High priority
+## Следующая диагностика
 
-- Restore recommendation shelves with the minimal verified change from blocked `www.wildberries.ru/__internal/recom/...` to `recom.wb.ru/recom/...`.
-- Add a shelf regression test that checks the endpoint, authenticated headers, product extraction, and distinction between a missing product and an HTTP error.
-- After the shelf fix, deploy and verify one real owner article against its configured competitors.
-- Confirm the Geo result once from the Telegram button. The underlying production function already returned valid positions for all 8 cities after deploy.
+- Перед ответом о блокировке проверять recovery, реальные HTTP и журнал очереди
+  с точным интервалом МСК. Разделять сетевые ошибки, HTTP, локальное ожидание и отказ входа.
+- Для точного ответа о количестве фраз добавить счётчики полных/неполных ключей,
+  повторов и заданий с явным безопасным source/job ID. Определить отдельно уникальные
+  фразы и пары товар–фраза; не заменять их делением HTTP на четыре.
+- При необходимости связать `interactive` с заданиями внешнего сайта. Соседняя память
+  wb-ads описывает stdin/NDJSON bridge, но в HTTP-аудите пока нет точной связи с job ID.
+- Фиксированная квота/TTL WB и универсальная безопасная частота не установлены.
+  Новые сравнения оценивать по полным результатам и календарному времени с cooldown.
+  Штатный backoff 300 с; экспериментальные 60/120 с не стали постоянной политикой.
 
-## Medium priority
+## Технические долги
 
-- Preserve but review the current Geo behavior: up to 5 pages per query/region can create a large batch when a product is absent.
-- Make Geo display `ERR` for a WB/network failure instead of the same dash used for “not found,” and stop a batch after a classified `429/498`.
-- Review scheduled load: 2 owner articles × 6 keywords × 4 page requests every 20 minutes, approximately 3,456 WB requests per day. Other users currently have no auto-enabled articles.
-- Decide whether the local `deploy/wb-cart-stock-worker.service` change should be committed. It matches the installed production unit but is a pre-existing user change and must not be silently included in unrelated commits.
-- Review the stale cart-stock health state if new cart-stock jobs fail; the worker itself is active and the outbox is empty.
+- Перед повтором `scripts/wb_bot_pacing_benchmark.py` пересмотреть его восстановление
+  bot=batch4: сейчас production bot/site оба serial50. Сохранять и восстанавливать
+  актуальную конфигурацию, если будет поручен новый эксперимент.
+- Изолировать audit mock-тестов `tests/session_monitor_test.py` во временный DATA_DIR:
+  сейчас тест full_probe оставляет 4×200 и 1×498 в локальном runtime-журнале.
+- Полки: заново проверить endpoint, auth, формат ответа; затем минимальное исправление,
+  релевантные тесты и production-проверка. Успех `recom.wb.ru` 9 сентября не доказывает
+  его текущую работоспособность. Ошибку WB отличать от отсутствия товара.
+- Geo: свежая проверка через Telegram/функцию, затем по задаче отображение ERR вместо
+  одинакового прочерка при HTTP-сбое и отсутствии товара, остановка после 429/498.
+  Глубину и восемь регионов самовольно не менять.
+- mkeeper: внедрение собственного ограниченного пула сканирования, направленных
+  рекомендаций с историей и согласованных топов не начато. Исследование готово в
+  `data/research/mkeeper/`; серверная база mkeeper недоступна из клиентского пакета.
 
-## Low priority
+## Сопровождение
 
-- Consolidate WB endpoint constants and authenticated header/session loading so `parser.py` cannot drift from `proxy_positions.py` again.
-- Decide whether to create a project-native session-state command. The requested npm command cannot exist naturally without adding Node metadata to this Python repository.
-- Clean production untracked operational backups only in an explicit maintenance task with ownership confirmed.
-- Review or remove the two stale local WB proxy entries only with approval; production does not use them.
-- Update `WB_API_GUIDE.md` if it is still treated as current operational documentation.
+- Отдельно решить судьбу существующего изменения `deploy/wb-cart-stock-worker.service`;
+  не включать в несвязанный коммит. Operational backups на VPS также сохранять.
+- Локальные 2 WB-прокси и устаревшие локальные данные не копировать в production.
+- Проектная Python-команда сохранения контекста пока отсутствует; npm даёт ENOENT.
+- `WB_API_GUIDE.md` — отдельный исторический материал: перед использованием сверять с кодом.
+
+## Уже сделано — не выполнять заново без новой причины
+
+Автовосстановление сессии, подтверждение необходимости ручного входа, продолжение
+очереди по retry_at, сброс backoff после полного успеха, HTTP-аудит, общий pacing,
+приоритет Telegram и перевод обоих клиентов на 50 мс внедрены. Исследования 12 часов,
+пассивный час, 90 активных минут и ABBA-сравнение бота завершены, отчёты сохранены.
