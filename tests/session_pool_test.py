@@ -406,7 +406,7 @@ class SessionPoolTest(unittest.TestCase):
         self.assertEqual(pool.snapshot(self.a), before)
         self.assertEqual(pool.snapshot(self.a)["phone"], "79991234567")
 
-    def test_menu_identifies_phone_and_changes_action_when_login_expires(self):
+    def test_menu_identifies_phone_and_keeps_check_separate_from_renewal(self):
         pool.bind_phone(self.a, "79991234567")
         text, keyboard = bot._build_wb_sessions_view()
         phone = "+7 999 123-45-67"
@@ -417,10 +417,10 @@ class SessionPoolTest(unittest.TestCase):
         pool.record_health(pool.snapshot(self.a), {"state": "auth_expired", "status": 401})
         _, keyboard = bot._build_wb_sessions_view()
         buttons = [b for row in keyboard.inline_keyboard for b in row]
-        self.assertFalse(any(b.callback_data == "wbslot_check_" + self.a for b in buttons))
+        check = next(b for b in buttons if b.callback_data == "wbslot_check_" + self.a)
+        self.assertIn(phone, check.text)
         login = next(b for b in buttons if b.callback_data == "wbslot_login_" + self.a)
-        self.assertIn(phone, login.text)
-        self.assertIn("Обновить сессию", login.text)
+        self.assertEqual(login.text, "Обновить")
 
     def test_saved_phone_button_starts_code_flow_without_phone_prompt_or_duplicate_job(self):
         pool.bind_phone(self.a, "79991234567")

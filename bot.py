@@ -2297,16 +2297,12 @@ def _build_wb_sessions_view():
             lines.append("Последний ответ WB: " + str(row["status_code"]))
         lines.append("")
         sid = row["id"]
-        needs_login = row["state"] in ("empty", "login_required", "auth_expired", "antibot")
-        action = "login" if needs_login else "check"
-        action_text = "Обновить сессию" if needs_login else "Проверить"
-        buttons.append([InlineKeyboardButton(text=session_label + " · " + action_text,
-                                             callback_data="wbslot_" + action + "_" + sid)])
-        if not needs_login:
-            buttons.append([InlineKeyboardButton(text="Обновить сессию", callback_data="wbslot_login_" + sid)])
-        if not row["active"]:
-            buttons.append([InlineKeyboardButton(text="Сделать рабочей", callback_data="wbslot_activate_" + sid),
-                            InlineKeyboardButton(text="Удалить", callback_data="wbslot_delete_" + sid)])
+        buttons.append([
+            InlineKeyboardButton(text=session_label + " · Проверить", callback_data="wbslot_check_" + sid),
+            InlineKeyboardButton(text="Обновить", callback_data="wbslot_login_" + sid),
+            InlineKeyboardButton(text="✅ Рабочая" if row["active"] else "Сделать рабочей",
+                                 callback_data="wb_sessions" if row["active"] else "wbslot_activate_" + sid),
+        ])
     pause = recovery.cooldown_error(recovery.session_generation())
     if pause:
         if pause.get("error_state") == "parser_busy":
@@ -2319,6 +2315,8 @@ def _build_wb_sessions_view():
         lines.append(f"Заданий в очереди: {waiting}")
     if len(rows) < wb_sessions.MAX_SESSIONS:
         buttons.append([InlineKeyboardButton(text="➕ Добавить сессию", callback_data="wb_session_add")])
+    if any(not row["active"] for row in rows):
+        buttons.append([InlineKeyboardButton(text="Удалить резервную сессию", callback_data="wb_session_delete_menu")])
     buttons.append([InlineKeyboardButton(text="Обновить список", callback_data="wb_sessions"),
                     InlineKeyboardButton(text="⬅️ Настройки", callback_data="go_settings")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -2349,7 +2347,7 @@ async def _begin_wb_login(callback, state, sid):
     await callback.answer()
 
 
-@router.callback_query(F.data.in_({"wb_sessions", "wb_session_update", "wb_session_add"}))
+@router.callback_query(F.data.in_({"wb_sessions", "wb_session_update", "wb_session_add", "wb_session_delete_menu"}))
 async def wb_sessions_menu(callback: CallbackQuery, state: FSMContext):
     if not db.is_owner(callback.from_user.id):
         await callback.answer("Доступно только владельцу", show_alert=True)
@@ -2367,7 +2365,16 @@ async def wb_sessions_menu(callback: CallbackQuery, state: FSMContext):
         await _begin_wb_login(callback, state, sid)
         return
     await state.clear()
-    text, keyboard = _build_wb_sessions_view()
+    if callback.data == "wb_session_delete_menu":
+        reserves = [row for row in wb_sessions.list_sessions() if not row["active"]]
+        text = "Выбери резервную сессию для удаления." if reserves else "Резервных сессий для удаления нет."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            *[[InlineKeyboardButton(text="Удалить · " + _wb_session_label(row),
+                                   callback_data="wbslot_delete_" + row["id"])] for row in reserves],
+            [InlineKeyboardButton(text="⬅️ WB-сессии", callback_data="wb_sessions")],
+        ])
+    else:
+        text, keyboard = _build_wb_sessions_view()
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
     except Exception as error:
