@@ -13,6 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
@@ -235,6 +236,18 @@ _wb_session_jobs: dict[int, WbSessionJob] = {}
 _wb_login_target = ContextVar("wb_login_target", default=None)
 
 
+class WbLoginError(RuntimeError):
+    MESSAGES = {
+        "code_rejected": "WB отклонил код или срок его действия истёк. Обновите сессию и введите новый код.",
+        "completion_timeout": "WB не завершил авторизацию после кода: подтверждение доступа или выдача токенов не закончились. Повторите обновление сессии.",
+        "cancelled": "Обновление сессии отменено.",
+    }
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(self.MESSAGES[reason])
+
+
 def _get_wb_session_task_lock() -> asyncio.Lock:
     global _wb_session_task_lock
     if _wb_session_task_lock is None:
@@ -317,7 +330,8 @@ def _atomic_json_dump(path: str, data: dict):
 def _save_wb_login_debug(page, reason: str) -> dict:
     """Save the current WB login page for anti-bot/debug inspection."""
     debug_dir = os.path.join(config.DATA_DIR, "wb_login_debug")
-    os.makedirs(debug_dir, exist_ok=True)
+    os.makedirs(debug_dir, mode=0o700, exist_ok=True)
+    os.chmod(debug_dir, 0o700)
 
     safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "_", reason).strip("_")[:40] or "error"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -346,13 +360,15 @@ def _save_wb_login_debug(page, reason: str) -> dict:
     except Exception:
         pass
     try:
-        with open(html_path, "w", encoding="utf-8") as f:
+        fd = os.open(html_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(page.content())
     except Exception as e:
         logger.warning("WB login debug HTML save failed: %s", e)
         result["html"] = ""
     try:
         page.screenshot(path=screenshot_path, full_page=True)
+        os.chmod(screenshot_path, 0o600)
     except Exception as e:
         logger.warning("WB login debug screenshot save failed: %s", e)
         result["screenshot"] = ""
@@ -360,7 +376,7 @@ def _save_wb_login_debug(page, reason: str) -> dict:
     logger.info(
         "WB login debug saved: reason=%s url=%s title=%s html=%s screenshot=%s",
         reason,
-        result["url"],
+        urlsplit(result["url"]).hostname,
         result["title"],
         result["html"],
         result["screenshot"],
@@ -391,9 +407,78 @@ def _wb_context_has_auth_tokens(ctx, page) -> tuple[bool, dict]:
         "bearer": bool(ls_data.get("wbx__tokenData")),
         "pow": bool(ls_data.get("session-pow-token")),
         "wbaas": bool(cookies.get("x_wbaas_token")),
+        "wbauid": bool(cookies.get("_wbauid")),
         "sys_auth": ls_data.get("_sys_auth", ""),
     }
-    return bool(checks["bearer"] and checks["pow"] and checks["wbaas"]), checks
+    return all(checks[key] for key in ("bearer", "pow", "wbaas", "wbauid")), checks
+
+
+def _complete_wb_login(ctx, page, job, status_cb, *, timeout=120, poll_ms=1000):
+    """Finish WB.ID consent/redirect before reading the storefront credentials."""
+    from playwright.sync_api import Error as BrowserError
+
+    account_selected = consent_accepted = False
+    checks = {}
+    last_stage = None
+    http_errors = []
+
+    def response_received(response):
+        host = urlsplit(response.url).hostname
+        if host in ("id.wb.ru", "www.wildberries.ru", "wildberries.ru") and response.status >= 400:
+            http_errors.append({"host": host, "status": response.status})
+            del http_errors[:-8]
+
+    page.on("response", response_received)
+    started = time.monotonic()
+    try:
+        while time.monotonic() - started < timeout:
+            if job.cancel_event.is_set():
+                raise WbLoginError("cancelled")
+            ready = False
+            try:
+                host = urlsplit(page.url).hostname
+                body = _safe_body_text(page, 5000).lower()
+                if any(phrase in body for phrase in ("неверный код", "неправильный код", "код неверен",
+                                                     "код недействителен", "срок действия кода истёк", "срок действия кода истек")):
+                    raise WbLoginError("code_rejected")
+                if host in ("www.wildberries.ru", "wildberries.ru"):
+                    ready, checks = _wb_context_has_auth_tokens(ctx, page)
+                    stage = "storefront_tokens"
+                elif host == "id.wb.ru":
+                    stage = "wbid_redirect"
+                    action = _wb_saved_login_action(page, account_selected=account_selected,
+                                                   consent_accepted=consent_accepted)
+                    if action:
+                        name, button = action
+                        status_cb("👤 Подтверждаю аккаунт WB.ID…" if name == "account" else
+                                  "✅ Подтверждаю доступ Wildberries к WB.ID…")
+                        button.click(timeout=10000)
+                        account_selected |= name == "account"
+                        consent_accepted |= name == "consent"
+                        stage = "wbid_" + name
+                else:
+                    stage = "redirect"
+                if stage != last_stage:
+                    logger.info("WB login completion: stage=%s host=%s", stage, host)
+                    last_stage = stage
+            except BrowserError:
+                # Navigation can destroy the document while reading it.
+                stage = "navigation"
+            if ready:
+                status_cb("💾 Авторизация завершена. Проверяю и сохраняю сессию WB…")
+                return _save_wb_session_from_context(ctx, page)
+            page.wait_for_timeout(poll_ms)
+        raise WbLoginError("completion_timeout")
+    except Exception as error:
+        reason = error.reason if isinstance(error, WbLoginError) else type(error).__name__
+        logger.warning("WB login completion failed: reason=%s host=%s account_selected=%s consent_accepted=%s checks=%s http_errors=%s",
+                       reason, urlsplit(page.url).hostname, account_selected, consent_accepted,
+                       {key: bool(value) for key, value in checks.items()}, http_errors)
+        if not job.cancel_event.is_set():
+            _save_wb_login_debug(page, reason)
+        raise
+    finally:
+        page.remove_listener("response", response_received)
 
 
 def _start_wb_virtual_display() -> tuple[subprocess.Popen | None, str | None]:
@@ -659,39 +744,8 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     else:
                         page.keyboard.type(code, delay=120)
 
-                page.wait_for_timeout(10000)
-                body_after_code = _safe_body_text(page, 1200)
-                if (
-                    "неверный код" in body_after_code.lower()
-                    or "ошибка" in body_after_code.lower()
-                ):
-                    _save_wb_login_debug(page, "code_rejected")
-                    raise RuntimeError("WB не принял код. Проверь код и запусти обновление заново.")
-
-                status_cb("💾 Получаю полный набор токенов WB...")
-                try:
-                    page.wait_for_url(
-                        lambda url: "wildberries.ru" in url and "id.wb.ru" not in url,
-                        timeout=20000,
-                    )
-                except Exception:
-                    pass
-
-                last_checks = {}
-                for target in ("https://www.wildberries.ru/lk", "https://www.wildberries.ru/"):
-                    page.goto(target, timeout=30000, wait_until="domcontentloaded")
-                    for _ in range(12):
-                        page.wait_for_timeout(2500)
-                        has_tokens, last_checks = _wb_context_has_auth_tokens(ctx, page)
-                        if has_tokens:
-                            return _save_wb_session_from_context(ctx, page)
-
-                debug = _save_wb_login_debug(page, "missing_tokens_after_code")
-                raise RuntimeError(
-                    "WB ID принял код, но www.wildberries.ru не выдал полный набор токенов: "
-                    f"{last_checks}. Debug: html={debug.get('html') or '-'}, "
-                    f"screenshot={debug.get('screenshot') or '-'}."
-                )
+                status_cb("⏳ Завершаю вход WB.ID и ожидаю подтверждения авторизации…")
+                return _complete_wb_login(ctx, page, job, status_cb)
             finally:
                 browser.close()
     finally:
@@ -765,6 +819,10 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
             "Вход готов к работе. Статус доступен в разделе «WB-сессии».", parse_mode="HTML")
     except BlockingIOError:
         await bot.send_message(job.chat_id, "Эта сессия уже обслуживается. Повторите немного позже.")
+    except WbLoginError as error:
+        logger.warning("WB session update failed: reason=%s", error.reason)
+        await bot.send_message(job.chat_id,
+            "⚠️ " + str(error) + "\nНовый вход не опубликован. Прежняя авторизация сохранена.")
     except Exception as error:
         logger.warning("WB session update failed: %s", type(error).__name__)
         await bot.send_message(job.chat_id,

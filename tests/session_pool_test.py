@@ -436,6 +436,7 @@ class SessionPoolTest(unittest.TestCase):
              patch.object(bot, "_save_wb_session_from_context", return_value={"ok": True}):
             browser = playwright.return_value.__enter__.return_value.chromium.launch.return_value
             page = browser.new_context.return_value.new_page.return_value
+            page.url = "https://www.wildberries.ru/lk"
             phone_input = page.locator.return_value.first
             phone_input.get_attribute.return_value = "wb-phone-number"
             phone_input.input_value.return_value = phone
