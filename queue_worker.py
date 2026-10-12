@@ -5,6 +5,9 @@ Only one article is checked at a time, with a short pause between articles.
 
 import asyncio
 import logging
+import fcntl
+import os
+from pathlib import Path
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -13,6 +16,7 @@ from collections import defaultdict
 import config
 import wb_search_pacing
 import wb_search_recovery
+from wb_job_store import JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,10 @@ class Task:
     pause_callbacks: list = field(default_factory=list)
     retry_at: float = 0
     priority_handle: object = field(default=None, repr=False)
+    job_id: str | None = None
+    result: dict = field(default_factory=dict)
+    restored: bool = False
+    retry_generation: float = 0
 
 
 class PositionQueue:
@@ -50,7 +58,7 @@ class PositionQueue:
     - Thread-safe via asyncio.Lock
     """
 
-    def __init__(self, pause: float = PAUSE_BETWEEN_TASKS):
+    def __init__(self, pause: float = PAUSE_BETWEEN_TASKS, *, durable=False):
         self._user_queues: dict[int, list[Task]] = defaultdict(list)
         self._lock = asyncio.Lock()
         self._event = asyncio.Event()
@@ -60,10 +68,32 @@ class PositionQueue:
         self._pause = pause
         self._total_processed = 0
         self._tasks: dict[tuple, Task] = {}
+        self._durable = durable
+        self._store = None
+        self._process_lock = None
+        self.on_progress = None
+        self.on_restored_complete = None
+        self.authorize = None
 
     async def start(self):
         """Start the background worker."""
         if not self._running:
+            if self._durable:
+                fd = os.open(Path(config.DATA_DIR) / "position_queue.lock", os.O_RDWR | os.O_CREAT, 0o600)
+                self._process_lock = os.fdopen(fd, "a+")
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BaseException:
+                    self._process_lock.close(); self._process_lock = None
+                    raise
+                self._store = JobStore()
+                for row in self._store.pending():
+                    task = Task(uid=row["uid"], nm_id=row["nm_id"], keywords=row["keywords"],
+                                future=asyncio.get_running_loop().create_future(), label=row["label"],
+                                submitted_at=row["created_at"], job_id=row["id"], result=row["result"],
+                                restored=True, retry_at=row["retry_at"], retry_generation=row["generation"])
+                    self._tasks[(task.uid, task.nm_id, tuple(task.keywords))] = task
+                    self._user_queues[task.uid].append(task)
             self._running = True
             self._worker_task = asyncio.create_task(self._worker())
             logger.info("PositionQueue worker started (pause=%.1fs)", self._pause)
@@ -84,6 +114,9 @@ class PositionQueue:
                 task.future.cancel()
         self._tasks.clear()
         self._user_queues.clear()
+        if self._process_lock:
+            self._process_lock.close()
+            self._process_lock = None
         logger.info("PositionQueue worker stopped")
 
     async def submit(self, uid: int, nm_id: int, keywords: list[str],
@@ -97,6 +130,8 @@ class PositionQueue:
                 task = Task(uid=uid, nm_id=nm_id, keywords=list(keywords),
                             future=loop.create_future(), label=label or str(nm_id),
                             priority_handle=wb_search_pacing.reserve_bot_priority())
+                if self._store:
+                    task.job_id = self._store.add(uid, nm_id, keywords, task.label)
                 self._tasks[key] = task
                 self._user_queues[uid].append(task)
             if on_pause is not None:
@@ -140,30 +175,67 @@ class PositionQueue:
                 pass
         return False
 
+    async def _progress(self, task, kw, item):
+        value = dict(item)
+        if task.job_id:
+            value["_job_id"] = task.job_id
+        task.result[kw] = value
+        if self._store:
+            self._store.save(task)
+        if not value.get("error") and self.on_progress:
+            await self.on_progress(task, kw, value)
+
     async def _execute(self, task):
-        result = {}
-        pending = list(task.keywords)
+        if self.authorize and not self.authorize(task.uid):
+            task.result = {kw: {"error": True, "error_state": "access_revoked", "promo_pos": None,
+                                "organic_pos": None, "is_advertised": False} for kw in task.keywords}
+            return task.result
+        result = task.result
+        # Reapply idempotent history writes after a crash between the two DBs.
+        if self.on_progress:
+            for kw, value in list(result.items()):
+                if not value.get("error"):
+                    await self.on_progress(task, kw, value)
+        pending = [kw for kw in task.keywords if kw not in result or result[kw].get("error")]
         retries = 0
+        if pending and task.retry_at > time.time():
+            if not await self._wait_for_retry(task, task.retry_generation):
+                raise asyncio.CancelledError
         while pending and self._running:
             task.retry_at = 0
-            batch = await _positions_module.get_positions(task.nm_id, pending)
+            callback_var = getattr(_positions_module, "_keyword_callback", None)
+            token = callback_var.set(lambda kw, item: self._progress(task, kw, item)) if callback_var else None
+            try:
+                batch = await _positions_module.get_positions(task.nm_id, pending)
+            finally:
+                if callback_var:
+                    callback_var.reset(token)
             for kw in pending:
-                result[kw] = batch.get(kw, {"error": True, "error_state": "invalid_response",
-                    "promo_pos": None, "organic_pos": None, "is_advertised": False})
+                await self._progress(task, kw, batch.get(kw, {"error": True, "error_state": "invalid_response",
+                    "promo_pos": None, "organic_pos": None, "is_advertised": False}))
             pending = [kw for kw in task.keywords if result.get(kw, {}).get("error")]
             errors = [result[kw] for kw in pending]
-            if not errors or any(e.get("recovery_reason") == "login_required" for e in errors):
+            if not errors:
+                break
+            login_required = any(e.get("recovery_reason") == "login_required" for e in errors)
+            if login_required and not self._store:
                 break
             deadline = max((e.get("retry_at") or time.time() + (e.get("retry_after") or 0) for e in errors), default=0)
+            transient = any(e.get("error_state") in ("network_error", "auth_expired", "antibot", "rate_limited") for e in errors)
             if not any(e.get("retry_at") or e.get("retry_after") for e in errors):
-                break
-            if retries >= MAX_PAUSE_RETRIES:
+                if not self._store or not transient:
+                    break
+                deadline = time.time() + min(60 * 2 ** min(retries, 6), 3600)
+            if retries >= MAX_PAUSE_RETRIES and not self._store:
                 for kw in pending:
                     result[kw] = {**result[kw], "automatic_retries_exhausted": True}
                 break
             task.retry_at = max(time.time(), deadline)
             generation = next((e["retry_session_saved_at"] for e in errors if e.get("retry_session_saved_at") is not None),
                               wb_search_recovery.session_generation())
+            task.retry_generation = generation
+            if self._store:
+                self._store.save(task, "waiting_login" if login_required else "waiting", generation)
             logger.info("Position task paused: article=%s retry_at=%.3f remaining_keys=%d attempt=%d",
                         task.nm_id, task.retry_at, len(pending), retries + 1)
             await self._notify_pause(task)
@@ -254,10 +326,19 @@ class PositionQueue:
                 "Processing: uid=%s %s (%d keywords) | pending: %d",
                 task.uid, task.label, len(task.keywords), self.pending_count
             )
+            retry_task = False
             try:
-                context = wb_search_pacing.client_scope("bot") if task.priority_handle is not None else nullcontext()
+                context = wb_search_pacing.client_scope("bot") if self._durable or task.priority_handle is not None else nullcontext()
                 with context:
+                    if task.priority_handle is None:
+                        task.priority_handle = wb_search_pacing.reserve_bot_priority()
                     result = await self._execute(task)
+                if self._store:
+                    self._store.save(task, "completed")
+                if task.restored and self.on_restored_complete:
+                    await self.on_restored_complete(task, result)
+                if self._store:
+                    self._store.finish(task.job_id)
                 if not task.future.cancelled():
                     task.future.set_result(result)
                 logger.info("Done: %s (%.1fs since submit)",
@@ -268,10 +349,19 @@ class PositionQueue:
                 break
             except Exception as e:
                 logger.error("Task failed: %s — %s", task.label, e)
-                if not task.future.cancelled():
+                if self._store:
+                    task.retry_at = time.time() + 60
+                    task.retry_generation = wb_search_recovery.session_generation()
+                    self._store.save(task, "waiting", task.retry_generation)
+                    self._user_queues[task.uid].append(task)
+                    self._event.set()
+                    retry_task = True
+                elif not task.future.cancelled():
                     task.future.set_exception(e)
             finally:
                 self._release_priority(task)
+                if retry_task:
+                    continue
                 self._tasks.pop((task.uid, task.nm_id, tuple(task.keywords)), None)
                 if not task.future.done():
                     task.future.cancel()
@@ -284,4 +374,4 @@ class PositionQueue:
 
 
 # ── Global singleton ──
-position_queue = PositionQueue()
+position_queue = PositionQueue(durable=True)

@@ -100,7 +100,7 @@ class SearchRecoveryTest(unittest.TestCase):
         self.assertEqual(error["recovery_reason"], "login_required")
         self.assertGreater(error["retry_after"], 21000)
         notice = bot._evirma_error_notice([{"a": {**error, "error": True}}])
-        self.assertIn("Обновить WB-сессию", notice)
+        self.assertIn("WB-сессии", notice)
         self.session.write_text(json.dumps({"saved_at": 2}))
         self.assertIsNone(recovery.cooldown_error(2))
 

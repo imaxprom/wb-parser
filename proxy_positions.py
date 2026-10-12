@@ -9,6 +9,9 @@ Algorithm (same as evirma extension):
 """
 
 import asyncio
+from collections.abc import MutableMapping
+from contextvars import ContextVar
+from contextlib import contextmanager
 import itertools
 import json
 import logging
@@ -20,6 +23,7 @@ from typing import Optional
 from curl_cffi import requests as curl_requests
 
 import config
+import wb_sessions
 import wb_search_recovery
 import wb_search_audit
 import wb_search_pacing
@@ -94,27 +98,62 @@ _UA = WB_BROWSER_USER_AGENT
 SEARCH_URL = config.WB_SEARCH_URL
 
 # Authenticated session data (from wb_session.json)
-_wb_session: dict = {}
+class SessionContext(MutableMapping):
+    """Compatibility mapping for the website bridge, isolated per thread/task."""
+    def __init__(self):
+        self._value = ContextVar("wb_request_session", default=None)
+    def set(self, value):
+        self._value.set(value)
+    def _data(self):
+        return self._value.get() or {}
+    def __getitem__(self, key): return self._data()[key]
+    def __setitem__(self, key, value): self.set({**self._data(), key: value})
+    def __delitem__(self, key):
+        data = dict(self._data()); del data[key]; self.set(data)
+    def __iter__(self): return iter(self._data())
+    def __len__(self): return len(self._data())
+
+
+_wb_session = SessionContext()
+_session_override = ContextVar("wb_candidate_session", default=None)
+_keyword_callback = ContextVar("wb_keyword_callback", default=None)
+
+
+@contextmanager
+def using_session(value):
+    token = _session_override.set(value)
+    try:
+        yield
+    finally:
+        _session_override.reset(token)
+
+
+class SessionHeaders(dict):
+    def __init__(self, *args, generation=0, session_id=None, revision=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.generation, self.session_id, self.revision = generation, session_id, revision
+    def copy(self):
+        return SessionHeaders(self, generation=self.generation, session_id=self.session_id, revision=self.revision)
+
 
 _WB_SESSION_FILE = os.path.join(config.DATA_DIR, "wb_session.json")
 
 
 def _load_wb_session():
-    """Load authenticated session (Bearer, PoW, cookies) from file."""
+    """Read one complete active version; website callers keep this interface."""
     global _wb_session
-    try:
-        with open(_WB_SESSION_FILE) as f:
-            _wb_session = json.load(f)
-        ls = _wb_session.get("localStorage", {})
-        has_bearer = bool(ls.get("wbx__tokenData"))
-        has_pow = bool(ls.get("session-pow-token"))
-        logger.info("WB session loaded: Bearer=%s PoW=%s", has_bearer, has_pow)
-    except Exception:
-        _wb_session = {}
-        logger.warning("No wb_session.json — running without auth")
+    if wb_sessions.enabled():
+        data = wb_sessions.snapshot()["session"]
+    else:
+        data = wb_sessions.read_json(_WB_SESSION_FILE)
+    if isinstance(_wb_session, SessionContext):
+        _wb_session.set(data)
+    else:  # compatibility for old callers and tests injecting a plain mapping
+        _wb_session = data
+    return data
 
 
-def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
+def _build_headers(token_key: str, with_bearer: bool = True, *, session_data=None) -> dict:
     """Build request headers with full auth if available.
 
     with_bearer=False — для гео-сканера: Bearer привязывает результаты
@@ -132,8 +171,14 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
         "sec-fetch-dest": "empty",
     }
 
-    ls = _wb_session.get("localStorage", {})
-    cookies = _wb_session.get("cookies", {})
+    source = session_data if session_data is not None else _session_override.get()
+    if source is None:
+        source = dict(_wb_session)
+    ls = source.get("localStorage", {})
+    cookies = source.get("cookies", {})
+    if wb_sessions.enabled() and (not ls.get("wbx__tokenData") or not cookies.get("x_wbaas_token")):
+        from wb_health import WbAuthExpiredError
+        raise WbAuthExpiredError("Нет проверенной авторизации WB", status_code=401)
 
     device_id = ls.get("wbx__sessionID")
     if device_id:
@@ -177,7 +222,7 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
 
     # Cookies: x_wbaas_token + _wbauid
     cookie_parts = []
-    wbaas = _get_wbaas_token(token_key)
+    wbaas = cookies.get("x_wbaas_token", "") if token_key == "__direct__" else _get_wbaas_token(token_key)
     if wbaas:
         cookie_parts.append(f"x_wbaas_token={wbaas}")
     elif cookies.get("x_wbaas_token"):
@@ -187,7 +232,8 @@ def _build_headers(token_key: str, with_bearer: bool = True) -> dict:
     if cookie_parts:
         headers["Cookie"] = "; ".join(cookie_parts)
 
-    return headers
+    return SessionHeaders(headers, generation=source.get("saved_at", 0),
+                          session_id=source.get("pool_id"), revision=source.get("pool_revision"))
 
 
 def _search_sync(headers: dict, params: dict, proxy_url: str = None,
@@ -198,7 +244,7 @@ def _search_sync(headers: dict, params: dict, proxy_url: str = None,
             # Publish a rate/server pause before releasing the shared request
             # slot, so a waiting process cannot send the next request first.
             if pacing and error and (error.get("error_state") == "rate_limited" or error.get("retry_after")):
-                wb_search_recovery.recover(error, _wb_session.get("saved_at", 0), allow_refresh=False)
+                wb_search_recovery.recover(error, getattr(headers, "generation", _wb_session.get("saved_at", 0)), allow_refresh=False)
                 error.update(wb_search_recovery.cooldown_error(wb_search_recovery.session_generation()) or {})
                 error["pause_registered"] = True
             return data, error
@@ -227,18 +273,20 @@ def _search_unpaced_sync(headers: dict, params: dict, proxy_url: str = None,
         response_id = uuid.uuid4().hex if resp.status_code != 200 else None
         retry_after = retry_after_seconds(getattr(resp, "headers", {}).get("Retry-After"))
         wb_search_audit.record(started_at=started_at, elapsed_ms=int((time.monotonic() - started) * 1000),
-                               status=resp.status_code, generation=_wb_session.get("saved_at", 0),
+                               status=resp.status_code, generation=getattr(headers, "generation", _wb_session.get("saved_at", 0)),
                                response_id=response_id, retry_after=retry_after,
-                               params=params, has_proxy=bool(proxy_url), pacing=pacing)
+                               params=params, has_proxy=bool(proxy_url), pacing=pacing,
+                               session_id=getattr(headers, "session_id", None))
         response_recorded = True
         logger.info(
             "WB search response: status=%s elapsed_ms=%d session_saved_at=%s response_id=%s retry_after=%s",
             resp.status_code, int((time.monotonic() - started) * 1000),
-            _wb_session.get("saved_at", 0), response_id, retry_after,
+            getattr(headers, "generation", _wb_session.get("saved_at", 0)), response_id, retry_after,
         )
         if resp.status_code == 200:
             return resp.json(), None
-        evidence = {"request_source": "search_http", "response_id": response_id}
+        evidence = {"request_source": "search_http", "response_id": response_id,
+                    "session_generation": getattr(headers, "generation", _wb_session.get("saved_at", 0))}
         if resp.status_code in RATE_LIMIT_HTTP_STATUSES:
             logger.warning("429 rate limit")
             return {}, {
@@ -277,8 +325,9 @@ def _search_unpaced_sync(headers: dict, params: dict, proxy_url: str = None,
     except Exception as e:
         if not response_recorded:
             wb_search_audit.record(started_at=started_at, elapsed_ms=int((time.monotonic() - started) * 1000),
-                                   status=None, generation=_wb_session.get("saved_at", 0),
-                                   response_id=None, retry_after=0, params=params, has_proxy=bool(proxy_url), pacing=pacing)
+                                   status=None, generation=getattr(headers, "generation", _wb_session.get("saved_at", 0)),
+                                   response_id=None, retry_after=0, params=params, has_proxy=bool(proxy_url), pacing=pacing,
+                               session_id=getattr(headers, "session_id", None))
         logger.error("Request error: %s", e)
         return {}, {
             "error_state": "network_error",
@@ -339,7 +388,7 @@ def _fetch_keyword_sync(proxy_raw: str, query: str, sku: int, dest: int,
         request_headers = headers
         if ab_testid:
             p["ab_testid"] = ab_testid
-            request_headers = dict(headers)
+            request_headers = headers.copy()
             request_headers.pop("X-Queryid", None)
         return _search_sync(request_headers, p, proxy_url, session)
 
@@ -481,6 +530,11 @@ async def get_positions(article: int, keywords: list[str],
 
     result = {}
     blocked_error = wb_search_recovery.cooldown_error(_wb_session.get("saved_at", 0))
+    if wb_sessions.enabled() and not _wb_session.get("localStorage", {}).get("wbx__tokenData"):
+        blocked_error = {"error_state": "parser_busy", "access_error_state": "auth_expired", "status_code": 401,
+                         "retry_at": time.time() + 900, "retry_after": 900, "recovery_reason": "login_required",
+                         "retry_session_saved_at": _wb_session.get("saved_at", 0),
+                         "error_message": "Ожидается вход в WB через раздел WB-сессии."}
     recovery_used = False
     access_errors = {"antibot", "auth_expired", "rate_limited"}
     session = None
@@ -490,7 +544,12 @@ async def get_positions(article: int, keywords: list[str],
         for kw in keywords:
             if blocked_error:
                 break
+            previous_generation = _wb_session.get("saved_at", 0)
+            _load_wb_session()
             generation = _wb_session.get("saved_at", 0)
+            if generation != previous_generation and session:
+                session.close()
+                session = curl_requests.Session(impersonate=WB_CURL_IMPERSONATE)
             started_at = time.time()
             item = await asyncio.to_thread(_fetch_keyword_sync, proxy_raw, kw, article, dest, session)
             if item.get("error") and item.get("error_state") in (None, "network_error") and not item.get("retry_after"):
@@ -533,6 +592,9 @@ async def get_positions(article: int, keywords: list[str],
                 "retry_session_saved_at": item.get("retry_session_saved_at"),
                 "recovery_reason": item.get("recovery_reason"),
             }
+            callback = _keyword_callback.get()
+            if callback is not None:
+                await callback(kw, result[kw])
             logger.info(
                 "Positions for %d '%s': promo=%s organic=%s is_ad=%s%s",
                 article, kw, item["promo_pos"], item["organic_pos"], item["is_advertised"],

@@ -19,7 +19,7 @@ _client = ContextVar("wb_search_pacing_client", default=None)
 @contextmanager
 def client_scope(name):
     """Select a known traffic source; propagated by asyncio.to_thread."""
-    if name not in ("bot", "rpc", "benchmark"):
+    if name not in ("bot", "rpc", "benchmark", "maintenance", "recovery"):
         raise ValueError("Unknown search client")
     token = _client.set(name)
     try:
@@ -127,14 +127,14 @@ class SearchPaused(Exception):
 
 
 @contextmanager
-def request_slot():
+def request_slot(*, recovery=False):
     directory = Path(config.DATA_DIR)
     with (directory / "wb_search_request.lock").open("a+") as lock:
         from wb_search_recovery import cooldown_error, session_generation
         state_path = directory / "wb_search_pacing_state.json"
         while True:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            if client_name() != "bot" and bot_priority_active():
+            if client_name() not in ("bot", "recovery") and bot_priority_active():
                 # The already admitted HTTP request may finish. No later
                 # website request starts until all bot reservations finish.
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -143,7 +143,9 @@ def request_slot():
             state = _read(state_path)
             pause = cooldown_error(session_generation())
             if pause:
-                raise SearchPaused(pause)
+                state_pause = _read(directory / "wb_search_recovery.json")
+                if not recovery or state_pause.get("server_delay"):
+                    raise SearchPaused(pause)
             current = policy()
             if current is None:
                 yield None

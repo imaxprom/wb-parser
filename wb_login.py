@@ -1,6 +1,10 @@
 """WB Auth via Playwright on VPS — v3. Handle custom login form."""
 import json, time, sys
 from playwright.sync_api import sync_playwright
+import wb_sessions
+
+if wb_sessions.enabled():
+    raise SystemExit("Для управления авторизацией используйте раздел WB-сессии в боте.")
 
 PHONE = "9607474717"  # without country code, WB adds +7
 

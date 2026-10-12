@@ -1,6 +1,7 @@
 """Telegram bot for WB Position Parser."""
 
 import asyncio
+from contextvars import ContextVar
 import html
 import json
 import logging
@@ -28,6 +29,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 import config
+import wb_sessions
 import db
 import parser
 import charts
@@ -221,6 +223,7 @@ def escape(text: str) -> str:
 class WbSessionJob:
     phone: str
     chat_id: int
+    session_id: str | None = None
     code_event: threading.Event = field(default_factory=threading.Event)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     code: str = ""
@@ -229,6 +232,7 @@ class WbSessionJob:
 
 
 _wb_session_jobs: dict[int, WbSessionJob] = {}
+_wb_login_target = ContextVar("wb_login_target", default=None)
 
 
 def _get_wb_session_task_lock() -> asyncio.Lock:
@@ -368,58 +372,12 @@ def _save_wb_login_debug(page, reason: str) -> dict:
 
 
 def _save_wb_session_from_context(ctx, page) -> dict:
-    cookies_list = ctx.cookies()
-    cookies = {c["name"]: c["value"] for c in cookies_list}
-    ls_data = page.evaluate("""() => {
-        var d = {};
-        for (var i = 0; i < localStorage.length; i++) {
-            var k = localStorage.key(i);
-            d[k] = localStorage.getItem(k);
-        }
-        return d;
-    }""")
-
-    sys_auth = ls_data.get("_sys_auth", "")
-    has_bearer = bool(ls_data.get("wbx__tokenData"))
-    has_pow = bool(ls_data.get("session-pow-token"))
-    has_wbaas = bool(cookies.get("x_wbaas_token"))
-
-    if not has_bearer or not has_pow or not has_wbaas:
-        raise RuntimeError(
-            "Логин не дал полный набор WB-сессии: "
-            f"Bearer={has_bearer}, PoW={has_pow}, wbaas={has_wbaas}."
-        )
-
-    session_data = {
-        "cookies": cookies,
-        "cookies_full": [dict(c) for c in cookies_list],
-        "localStorage": ls_data,
-        "saved_at": time.time(),
-    }
-    wb_session_path = os.path.join(config.DATA_DIR, "wb_session.json")
-    wb_state_path = os.path.join(config.DATA_DIR, "wb_playwright_state.json")
-    _atomic_json_dump(wb_session_path, session_data)
-    ctx.storage_state(path=wb_state_path)
-
-    wbaas_cache_path = os.path.join(config.DATA_DIR, "wbaas_proxy_tokens.json")
-    try:
-        with open(wbaas_cache_path) as f:
-            wbaas_cache = json.load(f)
-    except Exception:
-        wbaas_cache = {}
-    wbaas_cache["__direct__"] = {
-        "token": cookies["x_wbaas_token"],
-        "updated_at": time.time(),
-    }
-    _atomic_json_dump(wbaas_cache_path, wbaas_cache)
-
-    return {
-        "sys_auth": sys_auth,
-        "bearer": has_bearer,
-        "pow": has_pow,
-        "wbaas": has_wbaas,
-        "wbauid": cookies.get("_wbauid", ""),
-    }
+    from wb_session_runtime import _save_session
+    job = _wb_login_target.get()
+    if job and job.cancel_event.is_set():
+        raise RuntimeError("Вход отменён.")
+    return _save_session(ctx, page, session_id=job.session_id if job else None,
+                         cancelled=job.cancel_event.is_set if job else None)
 
 
 def _wb_context_has_auth_tokens(ctx, page) -> tuple[bool, dict]:
@@ -479,6 +437,10 @@ def _load_clean_wb_login_state(path: str) -> dict | None:
     except Exception:
         return None
 
+    return _clean_wb_login_state(state)
+
+
+def _clean_wb_login_state(state):
     allowed_cookie_names = {
         "wbid-refresh",
         "wbid-validation-key",
@@ -509,13 +471,18 @@ def _load_clean_wb_login_state(path: str) -> dict | None:
     return {"cookies": cookies, "origins": origins}
 
 
-def _run_wb_session_login_sync(phone: str, job: WbSessionJob,
-                               status_cb) -> dict:
-    """Serialize interactive login with automatic and cart-session refreshes."""
+def _run_wb_session_login_sync(phone: str, job: WbSessionJob, status_cb) -> dict:
     import fcntl
-    with open(os.path.join(config.DATA_DIR, "wb_session_refresh.lock"), "a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        return _run_wb_session_login_unlocked(phone, job, status_cb)
+    token = _wb_login_target.set(job)
+    try:
+        if job and job.session_id:
+            with wb_sessions.lock("slot_" + job.session_id, blocking=False):
+                return _run_wb_session_login_unlocked(phone, job, status_cb)
+        with open(os.path.join(config.DATA_DIR, "wb_session_refresh.lock"), "a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            return _run_wb_session_login_unlocked(phone, job, status_cb)
+    finally:
+        _wb_login_target.reset(token)
 
 
 def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
@@ -531,6 +498,7 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
     ctx = None
     try:
         with sync_playwright() as p:
+            target = wb_sessions.snapshot(job.session_id) if job and job.session_id else None
             login_state_path = os.path.join(config.DATA_DIR, "wb_login_working_state.json")
             launch_env = {**os.environ, "DISPLAY": display}
             browser = p.chromium.launch(
@@ -545,8 +513,9 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     "locale": "ru-RU",
                     "timezone_id": "Europe/Moscow",
                 }
-                if os.path.exists(login_state_path):
-                    clean_login_state = _load_clean_wb_login_state(login_state_path)
+                if target or os.path.exists(login_state_path):
+                    clean_login_state = (_clean_wb_login_state(target.get("login", {})) or
+                                         _clean_wb_login_state(target.get("browser", {}))) if target else _load_clean_wb_login_state(login_state_path)
                     if clean_login_state:
                         context_args["storage_state"] = clean_login_state
                         status_cb(
@@ -783,7 +752,7 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     f"screenshot={debug.get('screenshot') or '-'}."
                 )
             finally:
-                if ctx:
+                if ctx and not target:
                     try:
                         ctx.storage_state(path=login_state_path)
                     except Exception as e:
@@ -850,67 +819,23 @@ def _verify_current_wb_session_sync() -> tuple[int, int]:
 
 async def _run_wb_session_job(uid: int, job: WbSessionJob):
     loop = asyncio.get_running_loop()
-
-    def status(text: str):
+    def status(text):
         _schedule_status(loop, job.chat_id, text)
-
     try:
-        async with _get_wb_session_task_lock():
-            result = await asyncio.to_thread(
-                _run_wb_session_login_sync,
-                job.phone,
-                job,
-                status,
-            )
-            status("🧪 Проверяю новую сессию на поисковом endpoint WB...")
-            status_code, products_count = await asyncio.to_thread(_verify_current_wb_session_sync)
-        if status_code != 200 or products_count <= 0:
-            if status_code in ANTIBOT_HTTP_STATUSES:
-                raise build_antibot_error(status_code)
-            if status_code in RATE_LIMIT_HTTP_STATUSES:
-                raise WbRateLimitError(
-                    f"WB rate limit is active: HTTP {status_code}",
-                    status_code=status_code,
-                )
-            raise RuntimeError(
-                "WB всё ещё не отдаёт рабочую выдачу после обновления: "
-                f"HTTP {status_code}, товаров={products_count}."
-            )
-
-        await bot.send_message(
-            job.chat_id,
-            "✅ <b>WB-сессия обновлена</b>\n\n"
-            f"Аккаунт: <code>{escape(str(result.get('sys_auth') or 'unknown'))}</code>\n"
-            f"Проверка WB: HTTP 200, товаров в ответе: <b>{products_count}</b>\n\n"
-            "Бот уже подхватил новую сессию, перезапуск сервиса не нужен.",
-            parse_mode="HTML",
-        )
-    except WbAntibotError as e:
-        logger.warning("WB session was saved, but its manual verification was rejected: %s", e)
-        await bot.send_message(
-            job.chat_id,
-            "⚠️ <b>WB временно отклонил проверку</b>\n\n"
-            "Новая авторизация сохранена. Автоматических повторов не будет; "
-            "повторите ручную проверку позже.",
-            parse_mode="HTML",
-        )
-    except WbRateLimitError:
-        await bot.send_message(
-            job.chat_id,
-            "⏳ <b>WB временно ограничил частоту</b>\n\n"
-            "Авторизация сохранена. Автоматических повторов не будет.",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.exception("WB session update failed")
-        await bot.send_message(
-            job.chat_id,
-            f"⚠️ <b>Не удалось обновить WB-сессию</b>\n\n{escape(str(e))}",
-            parse_mode="HTML",
-        )
+        result = await asyncio.to_thread(_run_wb_session_login_sync, job.phone, job, status)
+        value = wb_sessions.snapshot(job.session_id)
+        await bot.send_message(job.chat_id,
+            "✅ <b>" + escape(value.get("name", "Сессия")) + " сохранена и проверена</b>\n\n"
+            "Вход готов к работе. Статус доступен в разделе «WB-сессии».", parse_mode="HTML")
+    except BlockingIOError:
+        await bot.send_message(job.chat_id, "Эта сессия уже обслуживается. Повторите немного позже.")
+    except Exception as error:
+        logger.warning("WB session update failed: %s", type(error).__name__)
+        await bot.send_message(job.chat_id,
+            "⚠️ Новый вход не опубликован. Прежняя авторизация сохранена.\n"
+            "Проверьте код или повторите вход позже. Причина: " + escape(type(error).__name__))
     finally:
-        current = _wb_session_jobs.get(uid)
-        if current is job:
+        if _wb_session_jobs.get(uid) is job:
             _wb_session_jobs.pop(uid, None)
 
 
@@ -1040,7 +965,12 @@ async def wb_session_phone_process(message: Message, state: FSMContext):
     await state.set_state(UpdateWbSession.waiting_code)
     await state.update_data(phone=phone)
 
-    job = WbSessionJob(phone=phone, chat_id=message.chat.id)
+    selected = (await state.get_data()).get("session_id")
+    if not selected or not wb_sessions.snapshot(selected).get("id"):
+        await state.clear()
+        await message.answer("Откройте раздел «WB-сессии» и выберите сессию.")
+        return
+    job = WbSessionJob(phone=phone, chat_id=message.chat.id, session_id=selected)
     _wb_session_jobs[uid] = job
     task = asyncio.create_task(_run_wb_session_job(uid, job))
     job.task = task
@@ -1062,6 +992,9 @@ async def wb_session_phone_process(message: Message, state: FSMContext):
 @router.message(UpdateWbSession.waiting_code, ~F.text.in_(MENU_TEXTS))
 async def wb_session_code_process(message: Message, state: FSMContext):
     uid = message.from_user.id
+    if not db.is_owner(uid):
+        await state.clear()
+        return
     code = _validate_wb_code(message.text)
     if not code:
         await message.answer("Код должен состоять из 6 цифр. Пришли код ещё раз.")
@@ -1713,6 +1646,7 @@ def _save_evirma_positions(uid: int, article: dict, queries: list, positions: di
             query["id"],
             promo_pos,
             1 if promo_pos and promo_pos <= 300 else 2,
+            job_key=pos_data.get("_job_id"),
         )
 
 
@@ -1820,6 +1754,9 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
 
         all_blocks = []
         all_position_sets = []
+        futures = [await position_queue.submit(uid, int(article["sku"]), keywords, label=article["sku"],
+                   on_pause=_position_pause_notifier(chat_id, msg_id, article["sku"]))
+                   for article, queries, keywords in task_infos]
         for i, (article, queries, keywords) in enumerate(task_infos):
             sku = article["sku"]
             art_name = article.get("name") or ""
@@ -1834,22 +1771,13 @@ async def _do_evirma_all(uid: int, chat_id: int, msg_id: int):
                 except Exception:
                     pass
 
-            future = await position_queue.submit(
-                uid,
-                int(sku),
-                keywords,
-                label=sku,
-                on_pause=_position_pause_notifier(chat_id, msg_id, sku),
-            )
-            positions = await future
+            positions = await futures[i]
             all_position_sets.append(positions)
 
             lines = _format_evirma_block(sku, keywords, positions, name=art_name)
             all_blocks.append(lines)
 
             _save_evirma_positions(uid, article, queries, positions)
-            if any(item.get("error") for item in positions.values()):
-                break
 
         elapsed = time.time() - start
         now = datetime.now().strftime("%H:%M %d.%m")
@@ -1976,7 +1904,7 @@ def _evirma_error_notice(position_sets: list[dict]) -> str:
         notice += " Автоматические повторы этой проверки завершены после повторных отказов."
     recovery_reasons = {item.get("recovery_reason") for item in errors}
     if "login_required" in recovery_reasons:
-        notice += " WB запросил подтверждение входа. Используйте «Обновить WB-сессию» в меню."
+        notice += " WB запросил подтверждение входа. Откройте «WB-сессии» в настройках."
     elif "login_unconfirmed" in recovery_reasons:
         retry_after = max((item.get("retry_after") or 0 for item in errors), default=0)
         notice += f" Сохранённый вход пока не восстановился. Повторная попытка доступна через {(retry_after + 59) // 60} мин."
@@ -2135,7 +2063,7 @@ def _build_settings_view(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     ])
     if db.is_owner(uid):
         kb.inline_keyboard.append([
-            InlineKeyboardButton(text="🔄 Обновить WB-сессию", callback_data="wb_session_update")
+            InlineKeyboardButton(text="🔐 WB-сессии", callback_data="wb_sessions")
         ])
         kb.inline_keyboard.append([
             InlineKeyboardButton(text="👥 Пользователи", callback_data="users_menu")
@@ -2335,49 +2263,143 @@ async def set_depth_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data == "wb_session_update")
-async def wb_session_update_start(callback: CallbackQuery, state: FSMContext):
-    uid = callback.from_user.id
-    if not db.is_owner(uid):
+_SESSION_STATES = {
+    "healthy": "готова", "unknown": "ещё не проверена", "empty": "нужен первый вход",
+    "login_required": "требуется вход", "auth_expired": "нужно восстановить вход",
+    "antibot": "WB отклонил проверку", "network_error": "ошибка соединения",
+    "invalid_response": "не удалось проверить ответ", "paused": "общая пауза WB",
+    "rate_limited": "общая пауза WB", "busy": "уже обслуживается", "switched": "выбрана рабочей",
+}
+
+
+def _session_age(stamp):
+    if not stamp:
+        return "ещё не было"
+    return datetime.fromtimestamp(stamp, ZoneInfo("Europe/Moscow")).strftime("%d.%m %H:%M МСК")
+
+
+def _build_wb_sessions_view():
+    import wb_search_recovery as recovery
+    rows = wb_sessions.list_sessions()
+    lines = ["🔐 <b>WB-сессии</b>", "Автопереключение включено. Слотов: " + str(len(rows)) + "/3", ""]
+    buttons = []
+    for row in rows:
+        label = _SESSION_STATES.get(row["state"], "ожидает проверки")
+        if row["state"] == "healthy" and row["checked_at"] < time.time() - 2 * wb_sessions.CHECK_INTERVAL:
+            label = "давно не проверялась"
+        icon = "🟢" if row["active"] and row["state"] == "healthy" else "🟡" if row["state"] == "healthy" else "⚪"
+        lines.extend([f"{icon} <b>{escape(row['name'])}</b> — {'рабочая' if row['active'] else 'резерв'} · {label}",
+                      "Проверена: " + _session_age(row["checked_at"]),
+                      "Последний успех: " + _session_age(row["success_at"])])
+        if row["status_code"] and row["status_code"] != 200:
+            lines.append("Последний ответ WB: " + str(row["status_code"]))
+        lines.append("")
+        sid = row["id"]
+        buttons.append([InlineKeyboardButton(text=row["name"] + " · Проверить", callback_data="wbslot_check_" + sid),
+                        InlineKeyboardButton(text="Обновить вход", callback_data="wbslot_login_" + sid)])
+        if not row["active"]:
+            buttons.append([InlineKeyboardButton(text="Сделать рабочей", callback_data="wbslot_activate_" + sid),
+                            InlineKeyboardButton(text="Удалить", callback_data="wbslot_delete_" + sid)])
+    pause = recovery.cooldown_error(recovery.session_generation())
+    if pause:
+        if pause.get("error_state") == "parser_busy":
+            lines.append("⏳ Проверки ожидают восстановления авторизации.")
+        else:
+            lines.append("⏳ Общая пауза до " + _session_age(pause.get("retry_at")))
+    if position_queue._store:
+        counts = position_queue._store.counts()
+        waiting = sum(n for state, n in counts.items() if state not in ("done", "cancelled"))
+        lines.append(f"Заданий в очереди: {waiting}")
+    if len(rows) < wb_sessions.MAX_SESSIONS:
+        buttons.append([InlineKeyboardButton(text="➕ Добавить сессию", callback_data="wb_session_add")])
+    buttons.append([InlineKeyboardButton(text="Обновить список", callback_data="wb_sessions"),
+                    InlineKeyboardButton(text="⬅️ Настройки", callback_data="go_settings")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _begin_wb_login(callback, state, sid):
+    if _wb_session_jobs.get(callback.from_user.id):
+        await callback.answer("Дождитесь текущего входа или отмените его.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(UpdateWbSession.waiting_phone)
+    await state.update_data(session_id=sid)
+    name = wb_sessions.snapshot(sid).get("name", "Сессия")
+    await callback.message.edit_text(
+        "🔐 <b>" + escape(name) + " · Вход в WB</b>\n\n"
+        "Пришли номер телефона аккаунта WB. Затем отправь код из приложения или SMS.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")]]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"wb_sessions", "wb_session_update", "wb_session_add"}))
+async def wb_sessions_menu(callback: CallbackQuery, state: FSMContext):
+    if not db.is_owner(callback.from_user.id):
         await callback.answer("Доступно только владельцу", show_alert=True)
         return
-
-    active = _wb_session_jobs.get(uid)
-    if active:
-        await callback.message.edit_text(
-            "🔄 <b>Обновление WB-сессии уже запущено</b>\n\n"
-            f"Номер: <b>{escape(_format_ru_phone(active.phone))}</b>\n"
-            "Пришли сюда 6-значный код из приложения/SMS или отмени процесс.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_settings")],
-            ]),
-        )
-        await state.set_state(UpdateWbSession.waiting_code)
-        await callback.answer()
+    wb_sessions.initialize()
+    if callback.data == "wb_session_add":
+        if _wb_session_jobs.get(callback.from_user.id):
+            await callback.answer("Сначала завершите текущий вход.", show_alert=True)
+            return
+        try:
+            sid = wb_sessions.create()
+        except ValueError as error:
+            await callback.answer(str(error), show_alert=True)
+            return
+        await _begin_wb_login(callback, state, sid)
         return
-
-    await state.set_state(UpdateWbSession.waiting_phone)
-    await callback.message.edit_text(
-        "🔄 <b>Обновить WB-сессию</b>\n\n"
-        "Пришли номер телефона аккаунта WB. Можно в любом формате:\n"
-        "<code>9159166999</code>\n"
-        "<code>89159166999</code>\n"
-        "<code>+7 915 916-69-99</code>\n\n"
-        "После этого я открою WB, запрошу код и попрошу отправить 6 цифр сюда.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_settings")],
-        ]),
-    )
+    await state.clear()
+    text, keyboard = _build_wb_sessions_view()
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as error:
+        if "message is not modified" not in str(error).lower():
+            raise
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^wbslot_(check|activate|login|delete)_[a-f0-9]{12}$"))
+async def wb_session_action(callback: CallbackQuery, state: FSMContext):
+    if not db.is_owner(callback.from_user.id):
+        await callback.answer("Доступно только владельцу", show_alert=True)
+        return
+    _, action, sid = callback.data.split("_")
+    if not wb_sessions.snapshot(sid).get("id"):
+        await callback.answer("Сессия уже удалена. Обновите список.", show_alert=True)
+        return
+    if action == "login":
+        await _begin_wb_login(callback, state, sid)
+        return
+    await callback.answer("Выполняю…")
+    try:
+        if action == "delete":
+            await asyncio.to_thread(wb_sessions.remove, sid)
+            result = "Сессия удалена."
+        elif action == "activate":
+            outcome = await asyncio.to_thread(wb_sessions.check_and_activate, sid)
+            result = _SESSION_STATES.get(outcome["state"], "Проверка не пройдена")
+        else:
+            def check():
+                with wb_sessions.lock("slot_" + sid, blocking=False):
+                    return wb_sessions.probe(wb_sessions.snapshot(sid), emergency=True)
+            outcome = await asyncio.to_thread(check)
+            result = _SESSION_STATES.get(outcome["state"], "Проверка не пройдена")
+    except BlockingIOError:
+        result = "Сессия уже обслуживается. Повторите позже."
+    except ValueError as error:
+        result = str(error)
+    text, keyboard = _build_wb_sessions_view()
+    await callback.message.edit_text(text + "\n" + escape(result), parse_mode="HTML", reply_markup=keyboard)
 
 
 @router.callback_query(F.data == "wb_session_cancel")
 async def wb_session_cancel(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
+    if not db.is_owner(uid):
+        await callback.answer("Доступно только владельцу", show_alert=True)
+        return
     job = _wb_session_jobs.pop(uid, None)
     if job:
         job.cancel_event.set()
@@ -3123,9 +3145,6 @@ def _format_shelf_results(sku: str, competitors: list, results: dict,
 async def scheduled_parse():
     """Auto-parse only articles that users explicitly enabled."""
     logger.info("Scheduled auto-parse started")
-    if _wb_session_jobs:
-        logger.info("Scheduled auto-parse skipped while WB authorization is active")
-        return
     users = db.get_allowed_users()
 
     async def parse_user(uid):
@@ -3151,23 +3170,17 @@ async def scheduled_parse():
                 keywords = [q["query"] for q in queries_list]
                 task_infos.append((article, queries_list, keywords))
 
-            for article, queries_list, keywords in task_infos:
+            futures = [await position_queue.submit(uid, int(article["sku"]), keywords, label=article["sku"])
+                       for article, queries_list, keywords in task_infos]
+            for (article, queries_list, keywords), future in zip(task_infos, futures):
                 sku = article["sku"]
                 art_name = article.get("name") or ""
-                future = await position_queue.submit(
-                    uid,
-                    int(sku),
-                    keywords,
-                    label=sku,
-                )
                 positions = await future
                 all_position_sets.append(positions)
                 lines = _format_evirma_block(sku, keywords, positions, name=art_name)
                 all_blocks.append(lines)
 
                 _save_evirma_positions(uid, article, queries_list, positions)
-                if any(item.get("error") for item in positions.values()):
-                    break
 
             elapsed = time.time() - start
 
@@ -3224,16 +3237,77 @@ def reschedule_parser():
     logger.info(f"Scheduler set to {interval} min interval")
 
 
+async def _save_queue_progress(task, keyword, value):
+    if not db.is_user_allowed(task.uid):
+        return
+    article = next((a for a in db.get_articles(task.uid) if a["sku"] == str(task.nm_id)), None)
+    if article:
+        queries = [q for q in db.get_queries(task.uid, article["id"]) if q["query"] == keyword]
+        _save_evirma_positions(task.uid, article, queries, {keyword: value})
+
+
+async def _deliver_restored_job(task, results):
+    if not db.is_user_allowed(task.uid):
+        return
+    text = "♻️ Проверка восстановлена после перезапуска.\n\n" + _format_evirma_results(
+        str(task.nm_id), task.keywords, results)
+    # Large restored jobs are split by keyword to preserve valid HTML boundaries.
+    if len(text) <= 4000:
+        await bot.send_message(task.uid, text, parse_mode="HTML")
+    else:
+        for keyword in task.keywords:
+            await bot.send_message(task.uid, _format_evirma_results(str(task.nm_id), [keyword], results), parse_mode="HTML")
+
+
+async def _maintain_wb_sessions():
+    try:
+        await asyncio.to_thread(wb_sessions.maintain)
+        events = wb_sessions.pending_events()
+        if not events:
+            return
+        owners = [u for u in db.get_allowed_users() if u["is_owner"]]
+        lines = []
+        for event in events:
+            name = wb_sessions.snapshot(event["session_id"]).get("name", "Сессия")
+            if event["kind"] == "unavailable":
+                state = event["detail"].rsplit(": ", 1)[-1]
+                line = name + ": " + _SESSION_STATES.get(state, "нужна проверка")
+            else:
+                line = event["detail"]
+            if line not in lines:
+                lines.append(line)
+        rows = wb_sessions.list_sessions()
+        if rows and not any(r["state"] == "healthy" for r in rows):
+            lines.append("Нет подтверждённых рабочих сессий. Задания сохраняются; проверьте вход.")
+        text = "🔐 WB-сессии\n" + "\n".join(lines) + "\nПодробности — в настройках бота."
+        for owner in owners:
+            await bot.send_message(owner["telegram_id"], text)
+        if owners:
+            wb_sessions.acknowledge_events([e["id"] for e in events])
+    except Exception as error:
+        logger.warning("WB session maintenance: %s", type(error).__name__)
+
+
 # --- Main ---
 
 async def main():
+    wb_sessions.initialize()
+    position_queue.authorize = db.is_user_allowed
+    position_queue.on_progress = _save_queue_progress
+    position_queue.on_restored_complete = _deliver_restored_job
+    scheduler.add_job(_maintain_wb_sessions, "interval", seconds=60, id="wb_sessions",
+                      max_instances=1, coalesce=True, replace_existing=True)
     reschedule_parser()
     scheduler.start()
     await position_queue.start()
 
     logger.info("Bot starting...")
     logger.info("Start polling")
-    await dp.start_polling(bot, polling_timeout=1)
+    try:
+        await dp.start_polling(bot, polling_timeout=1)
+    finally:
+        scheduler.shutdown(wait=False)
+        await position_queue.stop()
 
 
 if __name__ == "__main__":

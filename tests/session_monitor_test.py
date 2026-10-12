@@ -11,6 +11,12 @@ from scripts import wb_session_monitor as monitor
 
 
 class SessionMonitorTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        p = patch.object(monitor.config, "DATA_DIR", temporary.name)
+        p.start(); self.addCleanup(p.stop)
+
     def _login_window(self, phone_visible, token_ready, action_ready=lambda t: False):
         clock = [0]
         page = Mock()

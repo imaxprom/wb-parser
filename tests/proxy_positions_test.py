@@ -62,7 +62,7 @@ class ProxyPositionsTest(unittest.TestCase):
             )
 
         load_token_cache.assert_called_once_with()
-        load_wb_session.assert_called_once_with()
+        load_wb_session.assert_called()
         build_headers.assert_called_once_with("__direct__")
         self.assertEqual(request.call_args.args[0], proxy_positions.SEARCH_URL)
         self.assertEqual(

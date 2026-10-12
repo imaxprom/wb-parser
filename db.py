@@ -431,8 +431,13 @@ def swap_query_order(telegram_id: int, query_id: int, direction: str):
 # ============================================================
 
 def save_result(telegram_id: int, article_id: int, query_id: int, position: Optional[int],
-                page: Optional[int], total_found: int = 0):
+                page: Optional[int], total_found: int = 0, *, job_key: str | None = None):
     with _user_db(telegram_id) as conn:
+        if job_key:
+            conn.execute("CREATE TABLE IF NOT EXISTS position_job_commits (job_key TEXT, query_id INTEGER, PRIMARY KEY(job_key,query_id))")
+            inserted = conn.execute("INSERT OR IGNORE INTO position_job_commits VALUES(?,?)", (job_key, query_id))
+            if not inserted.rowcount:
+                return
         conn.execute(
             "INSERT INTO results (article_id, query_id, position, page, total_found) VALUES (?, ?, ?, ?, ?)",
             (article_id, query_id, position, page, total_found))

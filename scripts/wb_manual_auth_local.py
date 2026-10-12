@@ -19,6 +19,7 @@ from curl_cffi import requests as curl_requests
 from playwright.sync_api import sync_playwright
 
 import config
+import wb_sessions
 import proxy_positions
 
 
@@ -94,6 +95,8 @@ def verify_search() -> tuple[int, int]:
 
 
 def main():
+    if wb_sessions.enabled():
+        raise SystemExit("Авторизация управляется пулом. Используйте раздел WB-сессии в боте.")
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout-minutes", type=int, default=15)
     parser.add_argument(

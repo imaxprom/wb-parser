@@ -10,6 +10,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 import config
+import wb_sessions
 from wb_health import (
     WB_BROWSER_USER_AGENT,
     WbAuthExpiredError,
@@ -37,7 +38,7 @@ def _safe_body_text(page, limit: int = 1600) -> str:
         return ""
 
 
-def _save_session(ctx, page) -> dict:
+def _save_session(ctx, page, *, session_id=None, verified=None, expected_revision=None, cancelled=None) -> dict:
     cookies_list = ctx.cookies()
     cookies = {cookie["name"]: cookie["value"] for cookie in cookies_list}
     local_storage = page.evaluate(
@@ -68,6 +69,20 @@ def _save_session(ctx, page) -> dict:
         "localStorage": local_storage,
         "saved_at": time.time(),
     }
+    if wb_sessions.enabled():
+        current = wb_sessions.snapshot(session_id)
+        if not current.get("id"):
+            raise RuntimeError("Сессия удалена или не выбрана.")
+        browser_state = ctx.storage_state()
+        candidate = {"session": session_data, "browser": browser_state, "login": browser_state}
+        verification = verified or wb_sessions.probe(candidate, emergency=True)
+        if verification.get("state") != "healthy":
+            if verification.get("state") == "antibot":
+                raise build_antibot_error(verification.get("status"))
+            raise RuntimeError("Проверка новой авторизации: " + str(verification.get("state")))
+        wb_sessions.publish(current["id"], candidate,
+                            expected_revision=expected_revision or current.get("revision"), cancelled=cancelled)
+        return {**checks, "products": verification.get("products", 0)}
     _atomic_json_dump(data_dir / "wb_session.json", session_data)
 
     state_path = data_dir / "wb_playwright_state.json"
@@ -90,6 +105,14 @@ def _save_session(ctx, page) -> dict:
 
 def refresh_saved_session() -> dict:
     """Refresh WB cookies from storage state, with a cross-process file lock."""
+    if wb_sessions.enabled():
+        from scripts.wb_session_monitor import refresh_subprocess
+        result = refresh_subprocess(session_id=wb_sessions.snapshot().get("id"))
+        if result.get("state") != "refreshed":
+            if result.get("state") == "login_required":
+                raise WbAuthExpiredError("WB требует повторного входа")
+            raise RuntimeError("WB session refresh: " + str(result.get("state")))
+        return result
     data_dir = Path(config.DATA_DIR)
     state_path = data_dir / "wb_playwright_state.json"
     if not state_path.exists():

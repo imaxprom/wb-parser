@@ -16,7 +16,7 @@ _sequence = itertools.count(1)
 
 
 def record(*, started_at, elapsed_ms, status, generation, response_id,
-           retry_after, params, has_proxy, pacing=None):
+           retry_after, params, has_proxy, pacing=None, session_id=None):
     # Never accept headers, response bodies, query strings or command arguments.
     def number(name):
         try:
@@ -33,6 +33,8 @@ def record(*, started_at, elapsed_ms, status, generation, response_id,
              "page": number("page"), "dest": number("dest"),
              "no_promo": params.get("ab_testid") == "no_promo",
              "has_proxy": bool(has_proxy)}
+    if isinstance(session_id, str) and len(session_id) == 12 and all(c in "0123456789abcdef" for c in session_id):
+        event["session_id"] = session_id
     if pacing:
         event["pacing"] = {k: pacing[k] for k in ("name", "gap_ms", "batch_size", "batch_pause_ms")}
     try:

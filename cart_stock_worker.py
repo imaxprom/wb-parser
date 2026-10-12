@@ -20,6 +20,8 @@ from curl_cffi import requests as curl_requests
 from playwright.sync_api import sync_playwright
 
 import config
+import wb_sessions
+import wb_search_recovery
 import proxy_positions
 from wb_session_runtime import refresh_saved_session
 from wb_health import (
@@ -202,7 +204,9 @@ class CartStockWorker:
     def _auth_headers(self) -> tuple[dict, str | None]:
         proxy_positions._load_token_cache()
         proxy_positions._load_wb_session()
-        headers = proxy_positions._build_headers("__direct__", with_bearer=True)
+        self._auth_snapshot = wb_sessions.snapshot() if wb_sessions.enabled() else None
+        headers = proxy_positions._build_headers("__direct__", with_bearer=True,
+                    session_data=self._auth_snapshot["session"] if self._auth_snapshot else None)
         authorization = headers.get("Authorization", "")
         token = authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
         required = (authorization, headers.get("deviceid"), headers.get("Cookie"))
@@ -301,12 +305,14 @@ class CartStockWorker:
         self.browser_page = None
 
     def _ensure_browser_page(self):
+        value = getattr(self, "_auth_snapshot", None)
+        version = (value["id"], value["revision"], value["session"].get("saved_at")) if value else None
         page = getattr(self, "browser_page", None)
-        if page is not None and not page.is_closed():
+        if page is not None and not page.is_closed() and getattr(self, "_browser_version", None) == version:
             return page
 
         state_path = Path(config.DATA_DIR) / "wb_playwright_state.json"
-        if not state_path.exists():
+        if not value and not state_path.exists():
             raise RuntimeError("Saved WB Playwright state is missing; manual login is required")
 
         self.close_browser()
@@ -322,7 +328,7 @@ class CartStockWorker:
                 **launch_args,
             )
             self.browser_context = self.browser.new_context(
-                storage_state=str(state_path),
+                storage_state=value.get("browser", {}) if value else str(state_path),
                 viewport={"width": 1920, "height": 1080},
                 locale="ru-RU",
                 timezone_id="Europe/Moscow",
@@ -341,6 +347,7 @@ class CartStockWorker:
                 wait_until="domcontentloaded",
             )
             self.browser_page.wait_for_timeout(8000)
+            self._browser_version = version
             return self.browser_page
         except Exception:
             self.close_browser()
@@ -406,7 +413,41 @@ class CartStockWorker:
             self.last_error = "WB browser tunnel is unavailable; job remains queued"
             return False
 
+    def _recover_cart_session(self, articles, previous):
+        """A reserve must pass the card endpoint before a worker switches it."""
+        def verify(value):
+            self._auth_snapshot = value
+            headers = proxy_positions._build_headers("__direct__", session_data=value["session"])
+            status, body = self._browser_card_request(articles[:1], headers)
+            if status == 429:
+                wb_search_recovery.recover({"error_state": "rate_limited", "status_code": 429},
+                                           wb_sessions.generation(), allow_refresh=False)
+                return {"state": "rate_limited", "status": 429}
+            try:
+                products = json.loads(body).get("products")
+            except (ValueError, AttributeError):
+                products = None
+            valid = status == 200 and isinstance(products, list) and bool(products)
+            return {"state": "healthy" if valid else "auth_expired" if status == 401 else "invalid_response",
+                    "status": status}
+        with wb_sessions.lock("switch"):
+            if wb_sessions.generation() != previous["session"].get("saved_at", 0):
+                return True
+            result = wb_sessions.failover({"error_state": "auth_expired", "status_code": 401},
+                previous["session"].get("saved_at", 0), scope="cart", validator=verify)
+            if result:
+                return result["state"] == "switched"
+            self._auth_snapshot = previous
+            # A slot-local refresh is bounded and preserves the previous bundle
+            # when verification fails. It never publishes a search cooldown.
+            self.refresh_auth()
+            return True
+
     def _request_wb_batch(self, articles: list[str], allow_refresh: bool = True) -> list[dict]:
+        if wb_sessions.enabled():
+            pause = wb_search_recovery.cooldown_error(wb_search_recovery.session_generation())
+            if pause and wb_search_recovery._read(wb_search_recovery._state_path()).get("server_delay"):
+                raise WbRateLimitError("Действует общая пауза WB", status_code=429)
         headers, _ = self._auth_headers()
         try:
             status_code, response_text = self._browser_card_request(articles, headers)
@@ -419,15 +460,26 @@ class CartStockWorker:
                 scope=WB_HEALTH_SCOPE,
             )
             raise
+        value = getattr(self, "_auth_snapshot", None)
+        if value and status_code != 200:
+            wb_sessions.record_health(value, {"state": "auth_expired" if status_code == 401 else "antibot" if status_code in ANTIBOT_HTTP_STATUSES else
+                "rate_limited" if status_code == 429 else "network_error", "status": status_code}, scope="cart")
         if status_code == 401 and allow_refresh:
-            self.refresh_auth()
-            return self._request_wb_batch(articles, allow_refresh=False)
+            value = getattr(self, "_auth_snapshot", None)
+            if value:
+                if self._recover_cart_session(articles, value):
+                    self.close_browser()
+                    return self._request_wb_batch(articles, allow_refresh=False)
+            else:
+                self.refresh_auth()
+                return self._request_wb_batch(articles, allow_refresh=False)
         if status_code == 401:
             error = WbAuthExpiredError(
                 "WB rejected the buyer session after refresh: HTTP 401",
                 status_code=401,
             )
             record_auth_expired(401, str(error), "cart_stock_worker", scope=WB_HEALTH_SCOPE)
+            self.last_auth_failure_generation = value["session"].get("saved_at", 0) if value else None
             self.auth_state = "error"
             raise error
         if status_code in ANTIBOT_HTTP_STATUSES:
@@ -446,6 +498,9 @@ class CartStockWorker:
             )
             raise error
         if status_code in RATE_LIMIT_HTTP_STATUSES:
+            if wb_sessions.enabled():
+                wb_search_recovery.recover({"error_state": "rate_limited", "status_code": status_code},
+                                           wb_search_recovery.session_generation(), allow_refresh=False)
             error = WbRateLimitError(
                 f"WB rate limit is active: HTTP {status_code}",
                 status_code=status_code,
@@ -471,6 +526,8 @@ class CartStockWorker:
         products = data.get("products")
         if not isinstance(products, list):
             raise RuntimeError("Authorized WB card returned no products array")
+        if value:
+            wb_sessions.record_health(value, {"state": "healthy", "status": 200}, scope="cart")
         record_success("cart_stock_worker", scope=WB_HEALTH_SCOPE)
         return products
 
@@ -603,6 +660,13 @@ class CartStockWorker:
         self.heartbeat()
         access = get_access_health(WB_HEALTH_SCOPE)
         retry_delay = probe_delay_seconds(access)
+        if wb_sessions.enabled():
+            generation = wb_sessions.generation()
+            pause = wb_search_recovery.cooldown_error(generation)
+            if pause and wb_search_recovery._read(wb_search_recovery._state_path()).get("server_delay"):
+                return False
+            if access.get("state") == "auth_expired" and getattr(self, "last_auth_failure_generation", None) != generation:
+                retry_delay = 0
         if retry_delay > 0:
             now = time.time()
             if now - self.last_cooldown_log_at >= HEARTBEAT_SECONDS:

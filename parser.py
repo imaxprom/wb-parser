@@ -82,6 +82,11 @@ def _get_wbaas_token() -> str:
 
 def _build_headers() -> tuple[dict, Optional[dict]]:
     """Build headers with Bearer auth + x_wbaas_token cookie. Returns (headers, token_row)."""
+    import wb_sessions
+    if wb_sessions.enabled():
+        import proxy_positions
+        value = proxy_positions._load_wb_session()
+        return proxy_positions._build_headers("__direct__", session_data=value), None
     headers = {**HEADERS, "User-Agent": random.choice(USER_AGENTS)}
 
     # x_wbaas_token cookie (antibot)
@@ -507,6 +512,7 @@ async def _geo_scan_region(sku: str, query: str,
     async with _GEO_SEMAPHORE:
         def fetch_page(page: int) -> tuple[int, list[dict]]:
             """Returns (status_code, products). status=0 on exception."""
+            proxy_positions._load_wb_session()
             headers = proxy_positions._build_headers("__direct__")
             params = {
                 "appType": WB_APP_TYPE,
@@ -559,8 +565,7 @@ async def geo_scan(sku: str, query: str, regions: list[dict], pages_depth: int =
 
     if not proxy_positions._token_cache:
         proxy_positions._load_token_cache()
-    if not proxy_positions._wb_session:
-        proxy_positions._load_wb_session()
+    proxy_positions._load_wb_session()
 
     tasks = [_geo_scan_region(sku, query, r, pages_depth) for r in regions]
     results = await asyncio.gather(*tasks)
@@ -646,6 +651,7 @@ async def _recom_search(competitor_sku: str,
     }
 
     def do_request() -> tuple[list[dict], bool]:
+        proxy_positions._load_wb_session()
         headers = proxy_positions._build_headers("__direct__")
         try:
             resp = curl_requests.get(

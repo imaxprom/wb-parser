@@ -5,6 +5,8 @@ SMS requests, account changes or cart mutations are made by this program.
 """
 
 import argparse
+from contextlib import ExitStack
+from functools import partial
 import base64
 from collections import Counter
 from datetime import datetime, timezone
@@ -24,6 +26,7 @@ from urllib.parse import urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
+import wb_sessions
 import proxy_positions as positions
 from wb_health import is_antibot_response, retry_after_seconds
 
@@ -166,7 +169,7 @@ def probe(*, reload=True, full=False, sku=0):
                 "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
 
-def _resume_context(ctx, page, bot, save_session, directory):
+def _resume_context(ctx, page, bot, save_session, directory, value=None):
     """Wait through redirects before deciding that the saved login needs input."""
     account_selected = consent_accepted = False
     started = time.monotonic()
@@ -177,13 +180,17 @@ def _resume_context(ctx, page, bot, save_session, directory):
         if has_tokens and urlsplit(page.url).hostname in ("wildberries.ru", "www.wildberries.ru"):
             cookies = {c["name"]: c["value"] for c in ctx.cookies()}
             storage = page.evaluate("() => Object.fromEntries(Object.entries(localStorage))")
-            positions._wb_session = {"cookies": cookies, "localStorage": storage}
-            positions._token_cache = {}
-            verification = probe(reload=False)
+            candidate = {"cookies": cookies, "localStorage": storage}
+            if value is not None:
+                verification = wb_sessions.probe({"session": candidate}, emergency=True)
+            else:
+                with positions.using_session(candidate):
+                    verification = probe(reload=False)
             if verification["state"] != "healthy":
                 return {"state": "candidate_rejected", "verification": verification}
             save_session(ctx, page)
-            atomic_json(directory / "wb_login_working_state.json", ctx.storage_state())
+            if value is None:
+                atomic_json(directory / "wb_login_working_state.json", ctx.storage_state())
             return {"state": "refreshed", "verification": verification}
         action = bot._wb_saved_login_action(page, account_selected=account_selected,
                                            consent_accepted=consent_accepted)
@@ -211,7 +218,7 @@ def _resume_context(ctx, page, bot, save_session, directory):
     return {"state": "refresh_blocked", "reason": "browser_did_not_resume", "diagnostics": details}
 
 
-def resume_login():
+def resume_login(session_id=None):
     """Resume an already authorized WB.ID account, validate before publishing."""
     # Reuse the same helpers as the proven interactive flow, without its SMS
     # or Telegram callbacks. Importing bot does not start polling/scheduling.
@@ -220,11 +227,23 @@ def resume_login():
     from wb_session_runtime import _save_session
 
     directory = Path(config.DATA_DIR)
-    with (directory / "wb_session_refresh.lock").open("a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        state = bot._load_clean_wb_login_state(str(directory / "wb_login_working_state.json"))
-        if not state:
-            state = bot._load_clean_wb_login_state(str(directory / "wb_playwright_state.json"))
+    with ExitStack() as stack:
+        value = wb_sessions.snapshot(session_id) if wb_sessions.enabled() else None
+        if value is not None:
+            if not value.get("id"):
+                return {"state": "login_required", "reason": "no_saved_wbid"}
+            try:
+                stack.enter_context(wb_sessions.lock("slot_" + value["id"], blocking=False))
+            except BlockingIOError:
+                return {"state": "busy"}
+            value = wb_sessions.snapshot(value["id"])
+            state = bot._clean_wb_login_state(value.get("login", {})) or bot._clean_wb_login_state(value.get("browser", {}))
+        else:
+            lock = stack.enter_context((directory / "wb_session_refresh.lock").open("a+"))
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = bot._load_clean_wb_login_state(str(directory / "wb_login_working_state.json"))
+            if not state:
+                state = bot._load_clean_wb_login_state(str(directory / "wb_playwright_state.json"))
         if not state:
             return {"state": "login_required", "reason": "no_saved_wbid"}
         display_process, display = bot._start_wb_virtual_display()
@@ -247,15 +266,20 @@ def resume_login():
                     page.goto("https://www.wildberries.ru/", timeout=30000, wait_until="domcontentloaded")
                     page.wait_for_timeout(3000)
                     page.goto("https://www.wildberries.ru/security/login", timeout=30000, wait_until="domcontentloaded")
-                    return _resume_context(ctx, page, bot, _save_session, directory)
+                    save = partial(_save_session, session_id=value["id"], expected_revision=value["revision"],
+                                   verified={"state": "healthy", "status": 200}) if value else _save_session
+                    return _resume_context(ctx, page, bot, save, directory, value=value)
                 finally:
                     browser.close()
         finally:
             bot._stop_wb_virtual_display(display_process)
 
 
-def refresh_subprocess():
-    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--refresh"],
+def refresh_subprocess(session_id=None):
+    command = [sys.executable, str(Path(__file__).resolve()), "--refresh"]
+    if session_id:
+        command.extend(["--session-id", session_id])
+    child = subprocess.Popen(command,
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              text=True, start_new_session=True)
     try:
@@ -429,13 +453,14 @@ def main():
     parser.add_argument("--sku", type=int, default=0)
     parser.add_argument("--output", type=Path, default=Path(config.DATA_DIR) / "session-observation")
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--session-id")
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
     logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
     if args.refresh:
         try:
-            result = resume_login()
+            result = resume_login(args.session_id)
         except Exception as error:
             result = {"state": "refresh_error", "error_type": type(error).__name__}
         print(json.dumps(result))
