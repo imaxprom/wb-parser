@@ -118,7 +118,10 @@ def _defer(previous, error, generation, *, reason="rejected", minimum=0):
     failures = (previous.get("failures", 0) if previous.get("session_saved_at") == generation else 0) + 1
     requested = error.get("retry_after") or 0
     initial = RATE_LIMIT_INITIAL_DELAY if error.get("error_state") == "rate_limited" else 900
-    delay = max(minimum, requested, min(initial * 2 ** min(failures - 1, 5), 7200))
+    retry_498 = error.get("error_state") == "antibot" and error.get("status_code") == 498
+    backoff = (config.WB_SEARCH_498_RETRY_SECONDS if retry_498
+               else min(initial * 2 ** min(failures - 1, 5), 7200))
+    delay = max(minimum, requested, backoff)
     if error.get("error_state") == "rate_limited":
         from wb_search_pacing import policy
         pacing = policy()

@@ -144,6 +144,56 @@ class SessionPoolTest(unittest.TestCase):
             self.assertFalse(recovery.recover({"error_state": "antibot", "status_code": 498}, pool.generation()))
         probe.assert_called_once()
 
+    def test_498_reserve_rechecked_after_one_minute_not_healthy_check_interval(self):
+        value = pool.snapshot(self.b)
+        with patch.object(pool.time, "time", return_value=100000):
+            pool.record_health(value, {"state": "antibot", "status": 498})
+        with patch.object(pacing, "bot_priority_active", return_value=False), \
+                patch.object(pool, "probe", side_effect=self.probe_ok) as probe:
+            with patch.object(pool.time, "time", return_value=100059):
+                pool.maintain()
+                probe.assert_not_called()
+            with patch.object(pool.time, "time", return_value=100060):
+                pool.maintain()
+                probe.assert_called_once()
+                self.assertEqual(probe.call_args.args[0]["id"], self.b)
+            with patch.object(pool.time, "time", return_value=100120):
+                pool.maintain()
+                probe.assert_called_once()
+        self.assertEqual(pool.snapshot()["id"], self.a)
+        row = next(r for r in pool.list_sessions() if r["id"] == self.b)
+        self.assertEqual((row["state"], row["retry_at"]), ("healthy", 0))
+
+    def test_repeated_498_uses_fixed_minute_but_other_failures_keep_backoff(self):
+        value = pool.snapshot(self.b)
+        with patch.object(pool.time, "time", return_value=100000):
+            for status, expected in ((498, 60), (498, 60), (403, 3600)):
+                pool.record_health(value, {"state": "antibot", "status": status})
+                row = next(r for r in pool.list_sessions() if r["id"] == self.b)
+                self.assertEqual(row["retry_at"], 100000 + expected)
+
+    def test_498_reserve_not_selected_until_its_minute_expires(self):
+        with patch.object(pool.time, "time", return_value=100000):
+            pool.record_health(pool.snapshot(self.b), {"state": "antibot", "status": 498})
+        with pool.lock("switch"), patch.object(pool, "probe", side_effect=self.probe_ok) as probe:
+            with patch.object(pool.time, "time", return_value=100059):
+                self.assertIsNone(pool.failover(AUTH, pool.generation()))
+                probe.assert_not_called()
+            with patch.object(pool.time, "time", return_value=100060):
+                self.assertEqual(pool.failover(AUTH, pool.generation())["state"], "switched")
+        self.assertEqual(pool.snapshot()["id"], self.b)
+
+    def test_due_498_reserve_still_yields_to_bot_and_server_pause(self):
+        with patch.object(pool.time, "time", return_value=100000):
+            pool.record_health(pool.snapshot(self.b), {"state": "antibot", "status": 498})
+        with patch.object(pool.time, "time", return_value=100060), patch.object(pool, "probe") as probe:
+            with patch.object(pacing, "bot_priority_active", return_value=True):
+                pool.maintain()
+            recovery._save({"session_saved_at": pool.generation(), "server_delay": True, "retry_at": 100600})
+            with patch.object(pacing, "bot_priority_active", return_value=False):
+                pool.maintain()
+            probe.assert_not_called()
+
     def test_busy_reserve_cannot_block_failover_forever(self):
         with pool.lock("slot_" + self.b):
             with patch.object(recovery, "_refresh", return_value={"state": "refresh_error"}), patch.object(pool, "probe") as probe:

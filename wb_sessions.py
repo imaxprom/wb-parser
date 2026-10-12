@@ -353,7 +353,10 @@ def record_health(value, result, *, scope="search"):
                        (state, time.time(), value["id"]))
             return
         failures = 0 if state == "healthy" else row["failures"] + 1
-        retry = 0 if state == "healthy" else time.time() + min(900 * 2 ** min(failures - 1, 3), 7200)
+        delay = (config.WB_SEARCH_498_RETRY_SECONDS
+                 if state == "antibot" and result.get("status") == 498
+                 else min(900 * 2 ** min(failures - 1, 3), 7200))
+        retry = 0 if state == "healthy" else time.time() + delay
         db.execute("UPDATE sessions SET state=?,checked_at=?,success_at=?,status_code=?,failures=?,retry_at=? WHERE id=?",
                    (state, time.time(), time.time() if state == "healthy" else row["success_at"],
                     result.get("status"), failures, retry, value["id"]))
@@ -479,7 +482,9 @@ def maintain():
             for row in list_sessions():
                 if row["active"] or not row["revision"] or row["state"] == "login_required":
                     continue
-                if max(row["checked_at"] + CHECK_INTERVAL, row["retry_at"]) > time.time():
+                due = (row["retry_at"] if row["state"] != "healthy" and row["retry_at"]
+                       else row["checked_at"] + CHECK_INTERVAL)
+                if due > time.time():
                     continue
                 permitted, urgent = allowed()
                 if not permitted:

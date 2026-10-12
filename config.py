@@ -42,6 +42,8 @@ WB_SEARCH_URL = "https://www.wildberries.ru/__internal/search/exactmatch/ru/comm
 WB_DEST = "-1257786"  # Moscow, ул. Никольская 7-9 (ПВЗ в центре)
 WB_APP_TYPE = "64"
 WB_ITEMS_PER_PAGE = 100
+# Retry a rejected search session after one minute; healthy reserves stay usable.
+WB_SEARCH_498_RETRY_SECONDS = 60
 
 # Geo regions for geo-scanner
 # ПВЗ в центре каждого города (из all-poo-fr-v9.json)

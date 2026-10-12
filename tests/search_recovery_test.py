@@ -91,6 +91,40 @@ class SearchRecoveryTest(unittest.TestCase):
             self.assertFalse(recovery.recover(BLOCKED, 1))
         self.assertGreater(recovery.cooldown_error(1)["retry_after"], 29990)
 
+    def test_498_wait_is_one_minute_and_repeated_failures_do_not_extend_it(self):
+        for now in (100000, 100060, 100120):
+            with patch.object(recovery.time, "time", return_value=now):
+                self.assertFalse(recovery.recover(BLOCKED, 1, allow_refresh=False))
+                self.assertEqual(recovery.cooldown_error(1)["retry_after"], 60)
+            with patch.object(recovery.time, "time", return_value=now + 59):
+                self.assertEqual(recovery.cooldown_error(1)["retry_after"], 1)
+            with patch.object(recovery.time, "time", return_value=now + 60):
+                self.assertIsNone(recovery.cooldown_error(1))
+
+    def test_498_pause_prevents_http_and_resumes_saved_batch_after_deadline(self):
+        with patch.object(positions, "_fetch_keyword_sync", side_effect=[OK, dict(BLOCKED), OK]) as fetch, \
+                patch.object(positions.curl_requests, "Session"), \
+                patch.object(recovery, "_refresh", return_value={"state": "refresh_error"}) as refresh:
+            with patch.object(recovery.time, "time", return_value=100000):
+                first = asyncio.run(positions.get_positions(123, ["a", "b"]))
+                self.assertFalse(first["a"]["error"])
+                self.assertTrue(first["b"]["error"])
+            with patch.object(recovery.time, "time", return_value=100059):
+                waiting = asyncio.run(positions.get_positions(123, ["b"]))
+                self.assertTrue(waiting["b"]["error"])
+                self.assertEqual(fetch.call_count, 2)
+            with patch.object(recovery.time, "time", return_value=100060):
+                resumed = asyncio.run(positions.get_positions(123, ["b"]))
+                self.assertFalse(resumed["b"]["error"])
+        self.assertEqual([c.args[1] for c in fetch.call_args_list], ["a", "b", "b"])
+        refresh.assert_called_once()
+
+    def test_498_minute_does_not_shorten_existing_server_pause(self):
+        with patch.object(recovery.time, "time", return_value=100000):
+            recovery._save({"session_saved_at": 1, "server_delay": True, "retry_at": 100600})
+            recovery.recover(BLOCKED, 1, allow_refresh=False)
+            self.assertEqual(recovery.cooldown_error(1)["retry_after"], 600)
+
     def test_sms_requirement_is_reported_and_manual_login_clears_pause(self):
         with patch.object(recovery, "_refresh", return_value={"state": "login_required"}) as refresh:
             self.assertFalse(recovery.recover(BLOCKED, 1))
