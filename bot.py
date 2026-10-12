@@ -244,20 +244,17 @@ def _get_wb_session_task_lock() -> asyncio.Lock:
 
 def _normalize_ru_phone(raw: str) -> str | None:
     """Return WB-friendly Russian phone digits: 79151234567."""
-    digits = re.sub(r"\D+", "", raw or "")
-    if len(digits) == 10 and digits.startswith("9"):
-        return "7" + digits
-    if len(digits) == 11 and digits.startswith("8"):
-        return "7" + digits[1:]
-    if len(digits) == 11 and digits.startswith("7"):
-        return digits
-    return None
+    return wb_sessions.normalize_phone(raw)
 
 
 def _format_ru_phone(phone: str) -> str:
     if len(phone) == 11 and phone.startswith("7"):
         return f"+7 {phone[1:4]} {phone[4:7]}-{phone[7:9]}-{phone[9:11]}"
     return phone
+
+
+def _wb_session_label(value):
+    return _format_ru_phone(value["phone"]) if value.get("phone") else value.get("name", "Сессия")
 
 
 def _validate_wb_code(raw: str) -> str | None:
@@ -490,6 +487,8 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
     """Run WB buyer login in a blocking Playwright thread."""
     from playwright.sync_api import sync_playwright
 
+    if job.session_id and wb_sessions.snapshot(job.session_id).get("phone") != phone:
+        raise RuntimeError("Номер не совпадает с привязкой сессии. Откройте список заново.")
     status_cb("🖥 Запускаю полноценный Chromium для входа WB...")
     virtual_display, display = _start_wb_virtual_display()
     if not display:
@@ -498,8 +497,6 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
     ctx = None
     try:
         with sync_playwright() as p:
-            target = wb_sessions.snapshot(job.session_id) if job and job.session_id else None
-            login_state_path = os.path.join(config.DATA_DIR, "wb_login_working_state.json")
             launch_env = {**os.environ, "DISPLAY": display}
             browser = p.chromium.launch(
                 headless=False,
@@ -513,16 +510,8 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     "locale": "ru-RU",
                     "timezone_id": "Europe/Moscow",
                 }
-                if target or os.path.exists(login_state_path):
-                    clean_login_state = (_clean_wb_login_state(target.get("login", {})) or
-                                         _clean_wb_login_state(target.get("browser", {}))) if target else _load_clean_wb_login_state(login_state_path)
-                    if clean_login_state:
-                        context_args["storage_state"] = clean_login_state
-                        status_cb(
-                            "♻️ Восстанавливаю принятую WB.ID-авторизацию "
-                            "без cookies неудачной антибот-проверки."
-                        )
-
+                # An explicit button press requests a fresh code for the bound
+                # phone. Background WB.ID restoration remains in the monitor.
                 ctx = browser.new_context(**context_args)
                 ctx.add_init_script(
                     'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
@@ -531,13 +520,6 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                 status_cb("🌐 Открываю страницу входа WB...")
                 page.goto("https://www.wildberries.ru/", timeout=30000)
                 page.wait_for_timeout(3000)
-                has_tokens, _ = _wb_context_has_auth_tokens(ctx, page)
-                if has_tokens:
-                    status_cb(
-                        "✅ Сохранённое состояние входа уже авторизовано. "
-                        "Проверяю и сохраняю токены..."
-                    )
-                    return _save_wb_session_from_context(ctx, page)
                 page.goto("https://www.wildberries.ru/security/login", timeout=30000)
 
                 status_cb("🛡 Ожидаю завершения проверки браузера WB...")
@@ -547,46 +529,12 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     'input#wb-phone-number'
                 )
                 phone_ready = False
-                account_selected = False
-                consent_accepted = False
                 wait_started = time.time()
                 last_status_at = 0.0
                 while time.time() - wait_started < 300:
                     if job.cancel_event.is_set():
                         raise RuntimeError("Обновление отменено.")
                     try:
-                        has_tokens, _ = _wb_context_has_auth_tokens(ctx, page)
-                        if has_tokens:
-                            status_cb(
-                                "✅ WB.ID подтвердил сохранённый аккаунт. "
-                                "Сохраняю токены..."
-                            )
-                            return _save_wb_session_from_context(ctx, page)
-
-                        saved_login_action = _wb_saved_login_action(
-                            page,
-                            account_selected=account_selected,
-                            consent_accepted=consent_accepted,
-                        )
-                        if saved_login_action:
-                            action_name, action_button = saved_login_action
-                        else:
-                            action_name, action_button = None, None
-
-                        if action_name == "account":
-                            status_cb("👤 Выбираю подтверждённый аккаунт WB.ID...")
-                            action_button.click()
-                            account_selected = True
-                            page.wait_for_timeout(2000)
-                            continue
-
-                        if action_name == "consent":
-                            status_cb("✅ Подтверждаю доступ Wildberries к WB.ID...")
-                            action_button.click()
-                            consent_accepted = True
-                            page.wait_for_timeout(2000)
-                            continue
-
                         if page.locator(phone_selector).first.is_visible():
                             phone_ready = True
                             break
@@ -605,13 +553,6 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     current_url = page.url
                     title = page.title()
                     body = _safe_body_text(page, 1600)
-                    if "/lk" in current_url or "Профиль" in body or "Заказы" in body:
-                        status_cb(
-                            "✅ WB уже открыл личный кабинет. "
-                            "Сохраняю токены из текущего браузерного state..."
-                        )
-                        return _save_wb_session_from_context(ctx, page)
-
                     debug = _save_wb_login_debug(page, "wait_phone_input")
                     raise RuntimeError(
                         "WB не показал поле ввода телефона за 5 минут. "
@@ -752,11 +693,6 @@ def _run_wb_session_login_unlocked(phone: str, job: WbSessionJob,
                     f"screenshot={debug.get('screenshot') or '-'}."
                 )
             finally:
-                if ctx and not target:
-                    try:
-                        ctx.storage_state(path=login_state_path)
-                    except Exception as e:
-                        logger.warning("WB working login state save failed: %s", e)
                 browser.close()
     finally:
         _stop_wb_virtual_display(virtual_display)
@@ -825,7 +761,7 @@ async def _run_wb_session_job(uid: int, job: WbSessionJob):
         result = await asyncio.to_thread(_run_wb_session_login_sync, job.phone, job, status)
         value = wb_sessions.snapshot(job.session_id)
         await bot.send_message(job.chat_id,
-            "✅ <b>" + escape(value.get("name", "Сессия")) + " сохранена и проверена</b>\n\n"
+            "✅ <b>Сессия " + escape(_wb_session_label(value)) + " сохранена и проверена</b>\n\n"
             "Вход готов к работе. Статус доступен в разделе «WB-сессии».", parse_mode="HTML")
     except BlockingIOError:
         await bot.send_message(job.chat_id, "Эта сессия уже обслуживается. Повторите немного позже.")
@@ -957,21 +893,28 @@ async def wb_session_phone_process(message: Message, state: FSMContext):
         )
         return
 
-    old_job = _wb_session_jobs.get(uid)
-    if old_job:
-        old_job.cancel_event.set()
-        old_job.code_event.set()
-
-    await state.set_state(UpdateWbSession.waiting_code)
-    await state.update_data(phone=phone)
-
     selected = (await state.get_data()).get("session_id")
     if not selected or not wb_sessions.snapshot(selected).get("id"):
         await state.clear()
         await message.answer("Откройте раздел «WB-сессии» и выберите сессию.")
         return
+    await _start_wb_phone_login(message, state, uid, selected, phone)
+
+
+async def _start_wb_phone_login(message, state, uid, selected, phone):
+    if _wb_session_jobs.get(uid):
+        await message.answer("Дождитесь текущего входа или отмените его.")
+        return
+    try:
+        phone = wb_sessions.bind_phone(selected, phone)
+    except (ValueError, BlockingIOError) as error:
+        text = str(error) if isinstance(error, ValueError) else "Эта сессия уже обслуживается. Повторите позже."
+        await message.answer(text)
+        return
     job = WbSessionJob(phone=phone, chat_id=message.chat.id, session_id=selected)
     _wb_session_jobs[uid] = job
+    await state.set_state(UpdateWbSession.waiting_code)
+    await state.update_data(session_id=selected, phone=phone)
     task = asyncio.create_task(_run_wb_session_job(uid, job))
     job.task = task
     _background_tasks.add(task)
@@ -980,7 +923,7 @@ async def wb_session_phone_process(message: Message, state: FSMContext):
     await message.answer(
         "▶️ <b>Запускаю обновление WB-сессии</b>\n\n"
         f"Номер: <b>{escape(_format_ru_phone(phone))}</b>\n\n"
-        "Я буду писать статусы здесь. Когда WB пришлёт код в приложение или SMS, "
+        "Запрашиваю код для сохранённого номера. Когда WB пришлёт его в приложение или SMS, "
         "отправь сюда 6 цифр.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2288,15 +2231,21 @@ def _build_wb_sessions_view():
         if row["state"] == "healthy" and row["checked_at"] < time.time() - 2 * wb_sessions.CHECK_INTERVAL:
             label = "давно не проверялась"
         icon = "🟢" if row["active"] and row["state"] == "healthy" else "🟡" if row["state"] == "healthy" else "⚪"
-        lines.extend([f"{icon} <b>{escape(row['name'])}</b> — {'рабочая' if row['active'] else 'резерв'} · {label}",
+        session_label = _wb_session_label(row)
+        lines.extend([f"{icon} <b>{escape(session_label)}</b> — {'рабочая' if row['active'] else 'резерв'} · {label}",
                       "Проверена: " + _session_age(row["checked_at"]),
                       "Последний успех: " + _session_age(row["success_at"])])
         if row["status_code"] and row["status_code"] != 200:
             lines.append("Последний ответ WB: " + str(row["status_code"]))
         lines.append("")
         sid = row["id"]
-        buttons.append([InlineKeyboardButton(text=row["name"] + " · Проверить", callback_data="wbslot_check_" + sid),
-                        InlineKeyboardButton(text="Обновить вход", callback_data="wbslot_login_" + sid)])
+        needs_login = row["state"] in ("empty", "login_required", "auth_expired", "antibot")
+        action = "login" if needs_login else "check"
+        action_text = "Обновить сессию" if needs_login else "Проверить"
+        buttons.append([InlineKeyboardButton(text=session_label + " · " + action_text,
+                                             callback_data="wbslot_" + action + "_" + sid)])
+        if not needs_login:
+            buttons.append([InlineKeyboardButton(text="Обновить сессию", callback_data="wbslot_login_" + sid)])
         if not row["active"]:
             buttons.append([InlineKeyboardButton(text="Сделать рабочей", callback_data="wbslot_activate_" + sid),
                             InlineKeyboardButton(text="Удалить", callback_data="wbslot_delete_" + sid)])
@@ -2321,13 +2270,22 @@ async def _begin_wb_login(callback, state, sid):
     if _wb_session_jobs.get(callback.from_user.id):
         await callback.answer("Дождитесь текущего входа или отмените его.", show_alert=True)
         return
+    value = wb_sessions.snapshot(sid)
+    if not value.get("id"):
+        await callback.answer("Сессия уже удалена. Обновите список.", show_alert=True)
+        return
+    if value.get("phone"):
+        await callback.answer()
+        await _start_wb_phone_login(callback.message, state, callback.from_user.id, sid, value["phone"])
+        return
     await state.clear()
     await state.set_state(UpdateWbSession.waiting_phone)
     await state.update_data(session_id=sid)
-    name = wb_sessions.snapshot(sid).get("name", "Сессия")
+    name = value.get("name", "Сессия")
     await callback.message.edit_text(
         "🔐 <b>" + escape(name) + " · Вход в WB</b>\n\n"
-        "Пришли номер телефона аккаунта WB. Затем отправь код из приложения или SMS.",
+        "Пришли номер телефона аккаунта WB. Он сохранится за этой сессией; "
+        "при следующих обновлениях потребуется только код из приложения или SMS.",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Отменить", callback_data="wb_session_cancel")]]))
     await callback.answer()
@@ -3268,10 +3226,14 @@ async def _maintain_wb_sessions():
         owners = [u for u in db.get_allowed_users() if u["is_owner"]]
         lines = []
         for event in events:
-            name = wb_sessions.snapshot(event["session_id"]).get("name", "Сессия")
+            name = _wb_session_label(wb_sessions.snapshot(event["session_id"]))
             if event["kind"] == "unavailable":
                 state = event["detail"].rsplit(": ", 1)[-1]
                 line = name + ": " + _SESSION_STATES.get(state, "нужна проверка")
+            elif event["kind"] == "switched":
+                line = "Рабочая сессия: " + name
+            elif event["kind"] == "restored":
+                line = name + ": сессия восстановлена"
             else:
                 line = event["detail"]
             if line not in lines:

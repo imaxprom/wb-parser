@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
 import uuid
@@ -19,6 +20,7 @@ import config
 
 MAX_SESSIONS = 3
 CHECK_INTERVAL = 900
+SCHEMA_VERSION = 2
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +37,38 @@ def read_json(path):
         return json.loads(Path(path).read_text())
     except (OSError, ValueError):
         return {}
+
+
+def normalize_phone(raw):
+    value = str(raw or "").strip()
+    if not re.fullmatch(r"[+\d\s()-]+", value):
+        return None
+    digits = re.sub(r"\D", "", value)
+    if len(digits) == 10 and digits.startswith("9"):
+        return "7" + digits
+    if len(digits) == 11 and digits.startswith(("7", "8")):
+        return "7" + digits[1:]
+    return None
+
+
+def phone_from_bundle(bundle):
+    """Read only account fields, never delivery contacts or masked/encrypted values."""
+    storage = bundle.get("session", {}).get("localStorage", {})
+    phones = set()
+    for key, raw in storage.items():
+        if key != "wbx__tokenData" and not key.startswith("user-info-"):
+            continue
+        try:
+            profile = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            continue
+        if not isinstance(profile, dict):
+            continue
+        for field in ("phone", "formattedPhoneMobile"):
+            phone = normalize_phone(profile.get(field))
+            if phone:
+                phones.add(phone)
+    return next(iter(phones)) if len(phones) == 1 else None
 
 
 def atomic_json(path, value):
@@ -84,17 +118,17 @@ def _legacy_refresh_lock():
 
 def initialize():
     """Idempotent migration; the original files stay available for rollback."""
-    if enabled():
+    if read_json(root() / "ready.json").get("version", 0) >= SCHEMA_VERSION:
         return
     with lock("migration"), _legacy_refresh_lock():
-        if enabled():
+        if read_json(root() / "ready.json").get("version", 0) >= SCHEMA_VERSION:
             return
         path = root() / "registry.db"
         with connection() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL, revision TEXT,
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, revision TEXT, phone TEXT,
                     created_at REAL NOT NULL, checked_at REAL NOT NULL DEFAULT 0,
                     success_at REAL NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'empty',
                     status_code INTEGER, retry_at REAL NOT NULL DEFAULT 0,
@@ -111,28 +145,34 @@ def initialize():
                 );
             """)
             os.chmod(path, 0o600)
-            if db.execute("SELECT 1 FROM settings WHERE key='migrated'").fetchone():
-                atomic_json(root() / "ready.json", {"version": 1})
-                return
-            old = read_json(Path(config.DATA_DIR) / "wb_session.json")
-            if old.get("localStorage") and old.get("cookies"):
-                sid = uuid.uuid4().hex[:12]
-                revision = uuid.uuid4().hex
-                bundle = {"session": old,
-                          "browser": read_json(Path(config.DATA_DIR) / "wb_playwright_state.json"),
-                          "login": read_json(Path(config.DATA_DIR) / "wb_login_working_state.json")}
-                atomic_json(root() / sid / (revision + ".json"), bundle)
-                db.execute("INSERT INTO sessions(id,name,revision,created_at,state) VALUES(?,?,?,?,?)",
-                           (sid, "Сессия 1", revision, time.time(), "unknown"))
-                db.execute("INSERT INTO settings VALUES('active',?)", (sid,))
-                db.execute("INSERT INTO settings VALUES('generation',?)", (str(old.get("saved_at", 0)),))
-            db.execute("INSERT INTO settings VALUES('migrated','1')")
-        atomic_json(root() / "ready.json", {"version": 1})
+            if "phone" not in {row[1] for row in db.execute("PRAGMA table_info(sessions)")}:
+                db.execute("ALTER TABLE sessions ADD COLUMN phone TEXT")
+            if not db.execute("SELECT 1 FROM settings WHERE key='migrated'").fetchone():
+                old = read_json(Path(config.DATA_DIR) / "wb_session.json")
+                if old.get("localStorage") and old.get("cookies"):
+                    sid = uuid.uuid4().hex[:12]
+                    revision = uuid.uuid4().hex
+                    bundle = {"session": old,
+                              "browser": read_json(Path(config.DATA_DIR) / "wb_playwright_state.json"),
+                              "login": read_json(Path(config.DATA_DIR) / "wb_login_working_state.json")}
+                    atomic_json(root() / sid / (revision + ".json"), bundle)
+                    db.execute("INSERT INTO sessions(id,name,revision,created_at,state) VALUES(?,?,?,?,?)",
+                               (sid, "Сессия 1", revision, time.time(), "unknown"))
+                    db.execute("INSERT INTO settings VALUES('active',?)", (sid,))
+                    db.execute("INSERT INTO settings VALUES('generation',?)", (str(old.get("saved_at", 0)),))
+                db.execute("INSERT INTO settings VALUES('migrated','1')")
+            for row in db.execute("SELECT id,revision FROM sessions WHERE phone IS NULL AND revision IS NOT NULL").fetchall():
+                bundle = read_json(root() / row["id"] / (row["revision"] + ".json"))
+                phone = phone_from_bundle(bundle)
+                if phone:
+                    db.execute("UPDATE sessions SET phone=? WHERE id=?", (phone, row["id"]))
+        atomic_json(root() / "ready.json", {"version": SCHEMA_VERSION})
 
 
 def list_sessions():
     if not enabled():
         return []
+    initialize()
     with connection() as db:
         return [dict(r) for r in db.execute("""SELECT s.*, s.id=COALESCE(
             (SELECT value FROM settings WHERE key='active'),'') AS active
@@ -159,6 +199,7 @@ def snapshot(session_id=None):
                 "browser": read_json(Path(config.DATA_DIR) / "wb_playwright_state.json"),
                 "login": read_json(Path(config.DATA_DIR) / "wb_login_working_state.json"),
                 "id": None, "revision": None}
+    initialize()
     with connection() as db:
         row = db.execute("""SELECT s.*, (SELECT value FROM settings WHERE key='active') AS active_id,
             (SELECT value FROM settings WHERE key='generation') AS generation
@@ -171,7 +212,25 @@ def snapshot(session_id=None):
     if row["id"] == row["active_id"]:
         data["saved_at"] = float(row["generation"] or 0)
     data["pool_id"], data["pool_revision"] = row["id"], row["revision"]
-    return {**bundle, "session": data, "id": row["id"], "revision": row["revision"], "name": row["name"]}
+    return {**bundle, "session": data, "id": row["id"], "revision": row["revision"],
+            "name": row["name"], "phone": row["phone"]}
+
+
+def bind_phone(sid, raw):
+    """Bind once, including unfinished login attempts. Updating cannot change the account."""
+    phone = normalize_phone(raw)
+    if not phone:
+        raise ValueError("Некорректный номер телефона.")
+    initialize()
+    with lock("slot_" + sid, blocking=False), connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT phone FROM sessions WHERE id=?", (sid,)).fetchone()
+        if not row:
+            raise ValueError("Сессия уже удалена. Откройте список заново.")
+        if row["phone"] and row["phone"] != phone:
+            raise ValueError("Сессия уже привязана к другому номеру. Для другого номера добавьте новую сессию.")
+        db.execute("UPDATE sessions SET phone=? WHERE id=?", (phone, sid))
+    return phone
 
 
 def generation():
@@ -185,6 +244,7 @@ def _event(db, sid, kind, detail):
 
 def publish(sid, bundle, *, expected_revision=None, cancelled=None):
     """Publish only an already verified candidate. Never resurrect a deleted slot."""
+    initialize()
     revision = uuid.uuid4().hex
     # The identity check prevents accidentally filling a reserve with a copy of
     # an existing login; the same WB account with independent tokens is allowed.
@@ -200,6 +260,9 @@ def publish(sid, bundle, *, expected_revision=None, cancelled=None):
                 raise ValueError("Сессия уже изменена или удалена. Откройте список заново.")
             if cancelled and cancelled():
                 raise ValueError("Вход отменён.")
+            account_phone = phone_from_bundle(bundle)
+            if old["phone"] and account_phone and old["phone"] != account_phone:
+                raise ValueError("WB вернул другой аккаунт. Привязанный номер и прежняя сессия сохранены.")
             device = session.get("localStorage", {}).get("wbx__sessionID")
             for other in db.execute("SELECT id,revision FROM sessions WHERE id<>? AND revision IS NOT NULL", (sid,)):
                 other_session = read_json(root() / other["id"] / (other["revision"] + ".json")).get("session", {})
@@ -207,8 +270,8 @@ def publish(sid, bundle, *, expected_revision=None, cancelled=None):
                     session.get("localStorage", {}).get("wbx__tokenData") == other_session.get("localStorage", {}).get("wbx__tokenData")
                     and session.get("localStorage", {}).get("wbx__tokenData")):
                     raise ValueError("Этот вход уже сохранён в другой сессии. Выполните отдельный вход.")
-            db.execute("UPDATE sessions SET revision=?,state='healthy',checked_at=?,success_at=?,failures=0,retry_at=0,status_code=200 WHERE id=?",
-                       (revision, time.time(), time.time(), sid))
+            db.execute("UPDATE sessions SET revision=?,phone=COALESCE(phone,?),state='healthy',checked_at=?,success_at=?,failures=0,retry_at=0,status_code=200 WHERE id=?",
+                       (revision, account_phone, time.time(), time.time(), sid))
             active = db.execute("SELECT value FROM settings WHERE key='active'").fetchone()
             active_row = db.execute("SELECT state FROM sessions WHERE id=?", (active[0],)).fetchone() if active else None
             replace_unavailable = active_row and active_row[0] in ("login_required", "auth_expired", "antibot")

@@ -307,6 +307,152 @@ class SessionPoolTest(unittest.TestCase):
         self.assertNotIn("cookie", text)
         self.assertTrue(any(b.callback_data == "wb_session_add" for row in keyboard.inline_keyboard for b in row))
 
+    def test_phone_is_bound_once_and_survives_refresh_failure_and_restart(self):
+        phone = pool.bind_phone(self.a, "+7 (999) 123-45-67")
+        self.assertEqual(phone, "79991234567")
+        pool.publish(self.a, bundle("renewed"))
+        before = pool.snapshot(self.a)
+        with self.assertRaises(ValueError):
+            pool.bind_phone(self.a, "79991234568")
+        with self.assertRaises(ValueError):
+            pool.publish(self.a, bundle("cancelled"), cancelled=lambda: True)
+        pool.initialize()
+        self.assertEqual(pool.snapshot(self.a), before)
+        self.assertEqual(next(r for r in pool.list_sessions() if r["id"] == self.a)["phone"], phone)
+
+    def test_phone_extraction_ignores_contacts_encrypted_and_ambiguous_profiles(self):
+        value = bundle("profile")
+        storage = value["session"]["localStorage"]
+        storage["wb_delivery-points"] = json.dumps({"phone": "79991234568"})
+        storage["user-info-current"] = json.dumps({"phone": "+7 (999) 123-45-67"})
+        storage["wbx__tokenData"] = json.dumps({"phone": "encrypted79991234568"})
+        self.assertEqual(pool.phone_from_bundle(value), "79991234567")
+        storage["user-info-other"] = json.dumps({"phone": "79991234568"})
+        self.assertIsNone(pool.phone_from_bundle(value))
+        storage["user-info-current"] = json.dumps({"phone": "+7 999 ***-45-67"})
+        del storage["user-info-other"]
+        self.assertIsNone(pool.phone_from_bundle(value))
+
+    def test_publication_cannot_change_bound_account(self):
+        pool.bind_phone(self.a, "79991234567")
+        before = pool.snapshot(self.a)
+        candidate = bundle("wrong-account")
+        candidate["session"]["localStorage"]["user-info-current"] = json.dumps({"phone": "79991234568"})
+        with self.assertRaises(ValueError):
+            pool.publish(self.a, candidate)
+        self.assertEqual(pool.snapshot(self.a), before)
+
+    def test_v1_pool_backfills_phone_without_changing_authorization(self):
+        candidate = bundle("profile")
+        candidate["session"]["localStorage"]["user-info-current"] = json.dumps({"phone": "79991234567"})
+        pool.publish(self.a, candidate)
+        before = pool.snapshot(self.a)
+        with pool.connection() as db:
+            db.execute("ALTER TABLE sessions DROP COLUMN phone")
+        pool.atomic_json(pool.root() / "ready.json", {"version": 1})
+        with patch.object(pool, "probe") as probe:
+            pool.initialize(); pool.initialize()
+        probe.assert_not_called()
+        self.assertEqual(pool.snapshot(self.a), before)
+        self.assertEqual(pool.snapshot(self.a)["phone"], "79991234567")
+
+    def test_menu_identifies_phone_and_changes_action_when_login_expires(self):
+        pool.bind_phone(self.a, "79991234567")
+        text, keyboard = bot._build_wb_sessions_view()
+        phone = "+7 999 123-45-67"
+        self.assertIn(phone, text)
+        buttons = [b for row in keyboard.inline_keyboard for b in row]
+        check = next(b for b in buttons if b.callback_data == "wbslot_check_" + self.a)
+        self.assertIn(phone, check.text)
+        pool.record_health(pool.snapshot(self.a), {"state": "auth_expired", "status": 401})
+        _, keyboard = bot._build_wb_sessions_view()
+        buttons = [b for row in keyboard.inline_keyboard for b in row]
+        self.assertFalse(any(b.callback_data == "wbslot_check_" + self.a for b in buttons))
+        login = next(b for b in buttons if b.callback_data == "wbslot_login_" + self.a)
+        self.assertIn(phone, login.text)
+        self.assertIn("Обновить сессию", login.text)
+
+    def test_saved_phone_button_starts_code_flow_without_phone_prompt_or_duplicate_job(self):
+        pool.bind_phone(self.a, "79991234567")
+        state = AsyncMock()
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=42), data="wbslot_login_" + self.a,
+            answer=AsyncMock(), message=SimpleNamespace(chat=SimpleNamespace(id=56), answer=AsyncMock(), edit_text=AsyncMock()))
+        async def scenario():
+            with patch.dict(bot._wb_session_jobs, {}, clear=True), patch.object(bot.db, "is_owner", return_value=True), \
+                 patch.object(bot, "_run_wb_session_job", new_callable=AsyncMock) as run:
+                await bot.wb_session_action(callback, state)
+                job = bot._wb_session_jobs[42]
+                self.assertEqual((job.session_id, job.phone), (self.a, "79991234567"))
+                await job.task
+                await bot.wb_session_action(callback, state)
+                run.assert_awaited_once_with(42, job)
+        asyncio.run(scenario())
+        state.set_state.assert_awaited_once_with(bot.UpdateWbSession.waiting_code)
+        callback.message.edit_text.assert_not_awaited()
+
+    def test_new_phone_is_saved_before_login_and_cancellation_keeps_binding(self):
+        slot = pool.create()
+        state = AsyncMock()
+        state.get_data.return_value = {"session_id": slot}
+        message = SimpleNamespace(from_user=SimpleNamespace(id=42), chat=SimpleNamespace(id=56),
+                                  text="8 999 123 45 67", answer=AsyncMock())
+        callback = SimpleNamespace(from_user=message.from_user, answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock()))
+        async def scenario():
+            with patch.dict(bot._wb_session_jobs, {}, clear=True), patch.object(bot.db, "is_owner", return_value=True), \
+                 patch.object(bot, "_run_wb_session_job", new_callable=AsyncMock):
+                await bot._begin_wb_login(callback, state, slot)
+                state.set_state.assert_awaited_with(bot.UpdateWbSession.waiting_phone)
+                await bot.wb_session_phone_process(message, state)
+                job = bot._wb_session_jobs[42]
+                self.assertEqual(pool.snapshot(slot)["phone"], "79991234567")
+                await job.task
+                await bot.wb_session_cancel(callback, state)
+                self.assertTrue(job.cancel_event.is_set())
+                self.assertEqual(pool.snapshot(slot)["phone"], "79991234567")
+        asyncio.run(scenario())
+
+    def test_old_phone_prompt_cannot_rebind_an_existing_session(self):
+        pool.bind_phone(self.a, "79991234567")
+        state = AsyncMock()
+        state.get_data.return_value = {"session_id": self.a}
+        message = SimpleNamespace(from_user=SimpleNamespace(id=42), chat=SimpleNamespace(id=56),
+                                  text="79991234568", answer=AsyncMock())
+        with patch.object(bot.db, "is_owner", return_value=True), patch.object(bot, "_run_wb_session_job") as run:
+            asyncio.run(bot.wb_session_phone_process(message, state))
+        run.assert_not_called()
+        self.assertEqual(pool.snapshot(self.a)["phone"], "79991234567")
+
+    def test_manual_renewal_uses_fresh_browser_and_submits_saved_phone(self):
+        phone = pool.bind_phone(self.a, "79991234567")
+        job = bot.WbSessionJob(phone=phone, chat_id=1, session_id=self.a, code="123456")
+        job.code_event.set()
+        with patch("playwright.sync_api.sync_playwright") as playwright, \
+             patch.object(bot, "_start_wb_virtual_display", return_value=(None, ":123")), \
+             patch.object(bot, "_stop_wb_virtual_display"), \
+             patch.object(bot, "_wb_context_has_auth_tokens", return_value=(True, {})), \
+             patch.object(bot, "_wb_saved_login_action", return_value=None), \
+             patch.object(bot, "_safe_body_text", return_value=""), \
+             patch.object(bot, "_visible_button_by_text") as get_code, \
+             patch.object(bot, "_save_wb_session_from_context", return_value={"ok": True}):
+            browser = playwright.return_value.__enter__.return_value.chromium.launch.return_value
+            page = browser.new_context.return_value.new_page.return_value
+            phone_input = page.locator.return_value.first
+            phone_input.get_attribute.return_value = "wb-phone-number"
+            phone_input.input_value.return_value = phone
+            result = bot._run_wb_session_login_sync(phone, job, Mock())
+        self.assertTrue(result["ok"])
+        self.assertNotIn("storage_state", browser.new_context.call_args.kwargs)
+        phone_input.fill.assert_called_once_with("9991234567")
+        get_code.return_value.click.assert_called_once()
+        browser.close.assert_called_once()
+
+    def test_non_owner_cannot_request_code_from_saved_phone_button(self):
+        pool.bind_phone(self.a, "79991234567")
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=42), data="wbslot_login_" + self.a, answer=AsyncMock())
+        with patch.object(bot.db, "is_owner", return_value=False), patch.object(bot, "_start_wb_phone_login") as start:
+            asyncio.run(bot.wb_session_action(callback, AsyncMock()))
+        start.assert_not_called()
+
 
 class MigrationTest(unittest.TestCase):
     def test_existing_session_migrates_once_without_new_login(self):
