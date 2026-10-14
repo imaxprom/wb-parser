@@ -1,6 +1,6 @@
 """
 Global position-checking queue with fair round-robin scheduling.
-Only one article is checked at a time, with a short pause between articles.
+Only one article is checked at a time; HTTP pacing controls request delays.
 """
 
 import asyncio
@@ -28,7 +28,7 @@ else:
     import chrome_positions as _positions_module
     logger.info("Queue worker using CHROME mode")
 
-PAUSE_BETWEEN_TASKS = 3.0  # seconds between article checks
+PAUSE_BETWEEN_TASKS = 0.0  # HTTP pacing already applies across article boundaries
 MAX_PAUSE_RETRIES = 3
 PAUSE_POLL_SECONDS = 2
 
@@ -54,7 +54,7 @@ class PositionQueue:
     """Fair round-robin queue for position checks.
 
     - Tasks from different users are interleaved (round-robin)
-    - Rate limit: minimum PAUSE_BETWEEN_TASKS between article checks
+    - No additional article delay by default; HTTP pacing controls request rate
     - Thread-safe via asyncio.Lock
     """
 
