@@ -59,12 +59,135 @@ class SessionPoolTest(unittest.TestCase):
             pool.publish(self.b, bundle("a"))
         self.assertEqual(pool.snapshot(), before)
 
-    def test_max_three_slots_and_active_cannot_be_deleted(self):
-        pool.create()
-        with self.assertRaises(ValueError): pool.create()
+    def test_more_than_three_slots_preserve_active_and_unique_names(self):
+        before = pool.snapshot()
+        added = [pool.create() for _ in range(10)]
+        rows = pool.list_sessions()
+        self.assertEqual(len(rows), 12)
+        self.assertEqual(len({r["name"] for r in rows}), 12)
+        self.assertEqual(pool.snapshot(), before)
+        fourth = added[1]
+        pool.bind_phone(fourth, "79991234567")
+        pool.publish(fourth, bundle("fourth"))
+        self.assertEqual(pool.snapshot(fourth)["phone"], "79991234567")
+        self.assertEqual(pool.snapshot(), before)
         with self.assertRaises(ValueError): pool.remove(self.a)
         pool.remove(self.b)
         self.assertIsNone(pool.snapshot(self.b)["id"])
+        replacement = pool.create()
+        self.assertNotEqual(replacement, self.b)
+        self.assertEqual(pool.snapshot(replacement)["name"], "Сессия 2")
+
+    def test_concurrent_additions_keep_unique_slot_names(self):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            added = list(executor.map(lambda _: pool.create(), range(12)))
+        self.assertEqual(len(set(added)), 12)
+        self.assertEqual(len({r["name"] for r in pool.list_sessions()}), 14)
+
+    def test_fourth_account_can_take_over_and_failover_probe_count_stays_bounded(self):
+        for number in range(3, 13):
+            sid = pool.create()
+            pool.publish(sid, bundle(str(number)))
+            if number == 4:
+                fourth = sid
+        with pool.connection() as db:
+            db.execute("UPDATE sessions SET success_at=1")
+            db.execute("UPDATE sessions SET success_at=2 WHERE id=?", (fourth,))
+        with patch.object(pool, "probe", side_effect=self.probe_ok) as probe:
+            result = pool.failover(AUTH, pool.generation())
+        self.assertEqual(result["state"], "switched")
+        self.assertEqual(pool.snapshot()["id"], fourth)
+        probe.assert_called_once()
+        with patch.object(pool, "probe", return_value={"state": "network_error"}) as probe:
+            self.assertIsNone(pool.failover(AUTH, pool.generation()))
+        self.assertEqual(probe.call_count, 2)
+
+    def test_add_button_creates_fourth_slot_and_starts_its_login(self):
+        pool.create()
+        before = pool.snapshot()
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=42), data="wb_session_add", answer=AsyncMock())
+        state = AsyncMock()
+        with patch.object(bot.db, "is_owner", return_value=True), \
+             patch.dict(bot._wb_session_jobs, {}, clear=True), \
+             patch.object(bot, "_begin_wb_login", new_callable=AsyncMock) as login:
+            asyncio.run(bot.wb_sessions_menu(callback, state))
+        rows = pool.list_sessions()
+        self.assertEqual(len(rows), 4)
+        login.assert_awaited_once_with(callback, state, rows[-1]["id"])
+        self.assertEqual(pool.snapshot(), before)
+
+    def test_large_pool_menu_paginates_and_always_allows_adding(self):
+        for _ in range(23):
+            pool.create()
+        rows = pool.list_sessions()
+        for index, row in enumerate(rows):
+            pool.bind_phone(row["id"], str(79990000000 + index))
+        rows = pool.list_sessions()
+        seen = []
+        for page, expected in enumerate((10, 10, 5)):
+            text, keyboard = bot._build_wb_sessions_view(page)
+            self.assertLess(len(text), 4096)
+            self.assertIn("Сессий: 25", text)
+            self.assertIn(f"Страница {page + 1} из 3", text)
+            session_rows = [r for r in keyboard.inline_keyboard if r[0].callback_data.startswith("wbslot_check_")]
+            self.assertEqual(len(session_rows), expected)
+            for row, source in zip(session_rows, rows[page * 10:]):
+                self.assertEqual(len(row), 3)
+                self.assertIn(bot._wb_session_label(source), row[0].text)
+                seen.append(row[0].callback_data.removeprefix("wbslot_check_"))
+            callbacks = {b.callback_data for row in keyboard.inline_keyboard for b in row}
+            self.assertIn("wb_session_add", callbacks)
+            if page:
+                self.assertIn(f"wb_sessions_page_{page - 1}", callbacks)
+                self.assertIn(f"wb_sessions_page_{page}", callbacks)
+            if page < 2:
+                self.assertIn(f"wb_sessions_page_{page + 1}", callbacks)
+        self.assertEqual(seen, [r["id"] for r in rows])
+        self.assertEqual(bot._build_wb_sessions_view(999)[0], bot._build_wb_sessions_view(2)[0])
+        self.assertEqual(bot._build_wb_sessions_view(-1)[0], bot._build_wb_sessions_view(0)[0])
+
+    def test_page_callbacks_and_delete_menu_preserve_owner_access(self):
+        for _ in range(23):
+            pool.create()
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=42), data="wb_sessions_page_1", answer=AsyncMock(),
+                                   message=SimpleNamespace(edit_text=AsyncMock()))
+        state = AsyncMock()
+        for data in ("wb_sessions_page_1", "wb_session_delete_page_1", "wb_session_add"):
+            callback.data = data
+            with patch.object(bot.db, "is_owner", return_value=False):
+                asyncio.run(bot.wb_sessions_menu(callback, state))
+        callback.message.edit_text.assert_not_awaited()
+        state.clear.assert_not_awaited()
+        self.assertEqual(len(pool.list_sessions()), 25)
+        with patch.object(bot.db, "is_owner", return_value=True):
+            callback.data = "wb_sessions_page_1"
+            asyncio.run(bot.wb_sessions_menu(callback, state))
+            self.assertIn("Страница 2 из 3", callback.message.edit_text.call_args.args[0])
+            deleted = []
+            for page in range(3):
+                callback.data = f"wb_session_delete_page_{page}"
+                asyncio.run(bot.wb_sessions_menu(callback, state))
+                keyboard = callback.message.edit_text.call_args.kwargs["reply_markup"]
+                ids = [b.callback_data.removeprefix("wbslot_delete_") for row in keyboard.inline_keyboard
+                       for b in row if b.callback_data.startswith("wbslot_delete_")]
+                self.assertLessEqual(len(ids), 10)
+                deleted.extend(ids)
+            self.assertEqual(deleted, [r["id"] for r in pool.list_sessions() if not r["active"]])
+
+    def test_slot_action_retains_page_and_clamps_after_last_page_deletion(self):
+        for _ in range(9):
+            pool.create()
+        sid = pool.list_sessions()[-1]["id"]
+        pool.publish(sid, bundle("last-page"))
+        callback = SimpleNamespace(from_user=SimpleNamespace(id=42), data="wbslot_check_" + sid, answer=AsyncMock(),
+                                   message=SimpleNamespace(edit_text=AsyncMock()))
+        with patch.object(bot.db, "is_owner", return_value=True), patch.object(pool, "probe", side_effect=self.probe_ok):
+            asyncio.run(bot.wb_session_action(callback, AsyncMock()))
+            self.assertIn("Страница 2 из 2", callback.message.edit_text.call_args.args[0])
+            callback.data = "wbslot_delete_" + sid
+            asyncio.run(bot.wb_session_action(callback, AsyncMock()))
+        self.assertEqual(len(pool.list_sessions()), 10)
+        self.assertNotIn("Страница 2", callback.message.edit_text.call_args.args[0])
 
     def test_stale_or_cancelled_publication_cannot_replace_valid_login(self):
         before = pool.snapshot()

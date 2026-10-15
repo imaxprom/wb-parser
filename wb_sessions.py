@@ -1,4 +1,4 @@
-"""Three isolated WB logins. SQLite publishes immutable credential bundles.
+"""Isolated WB logins. SQLite publishes immutable credential bundles.
 
 Only this module publishes credentials. A reader obtains a complete version in
 one database read; probes never replace the process's working credentials.
@@ -18,7 +18,7 @@ import uuid
 
 import config
 
-MAX_SESSIONS = 3
+MAX_FAILOVER_PROBES = 2
 CHECK_INTERVAL = 900
 SCHEMA_VERSION = 2
 logger = logging.getLogger(__name__)
@@ -184,10 +184,11 @@ def create():
     with connection() as db:
         db.execute("BEGIN IMMEDIATE")
         rows = db.execute("SELECT name FROM sessions").fetchall()
-        if len(rows) >= MAX_SESSIONS:
-            raise ValueError("Можно добавить не больше трёх сессий.")
         names = {r[0] for r in rows}
-        name = next(f"Сессия {i}" for i in range(1, MAX_SESSIONS + 1) if f"Сессия {i}" not in names)
+        number = 1
+        while f"Сессия {number}" in names:
+            number += 1
+        name = f"Сессия {number}"
         sid = uuid.uuid4().hex[:12]
         db.execute("INSERT INTO sessions(id,name,created_at) VALUES(?,?,?)", (sid, name, time.time()))
         return sid
@@ -426,7 +427,7 @@ def failover(error, observed_generation, *, scope="search", validator=None):
     if scope != "search":
         candidates = [s for s in candidates if s["state"] == "healthy"]
     candidates.sort(key=lambda s: s["success_at"], reverse=True)
-    limit = 1 if error.get("error_state") == "antibot" else MAX_SESSIONS - 1
+    limit = 1 if error.get("error_state") == "antibot" else MAX_FAILOVER_PROBES
     for candidate in candidates[:limit]:
         try:
             with lock("slot_" + candidate["id"], blocking=False):

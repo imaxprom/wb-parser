@@ -2279,12 +2279,36 @@ def _session_age(stamp):
     return datetime.fromtimestamp(stamp, ZoneInfo("Europe/Moscow")).strftime("%d.%m %H:%M МСК")
 
 
-def _build_wb_sessions_view():
+_WB_SESSIONS_PAGE_SIZE = 10
+
+
+def _wb_sessions_page(rows, page):
+    pages = max(1, (len(rows) + _WB_SESSIONS_PAGE_SIZE - 1) // _WB_SESSIONS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    start = page * _WB_SESSIONS_PAGE_SIZE
+    return rows[start:start + _WB_SESSIONS_PAGE_SIZE], page, pages
+
+
+def _wb_sessions_navigation(page, pages, prefix):
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(text="← Назад", callback_data=prefix + str(page - 1)))
+    if page + 1 < pages:
+        buttons.append(InlineKeyboardButton(text="Далее →", callback_data=prefix + str(page + 1)))
+    return [buttons] if buttons else []
+
+
+def _build_wb_sessions_view(page=0):
     import wb_search_recovery as recovery
     rows = wb_sessions.list_sessions()
-    lines = ["🔐 <b>WB-сессии</b>", "Автопереключение включено. Слотов: " + str(len(rows)) + "/3", ""]
+    visible, page, pages = _wb_sessions_page(rows, page)
+    current_page = "wb_sessions" if page == 0 else "wb_sessions_page_" + str(page)
+    lines = ["🔐 <b>WB-сессии</b>", "Автопереключение включено. Сессий: " + str(len(rows))]
+    if pages > 1:
+        lines.append(f"Страница {page + 1} из {pages}")
+    lines.append("")
     buttons = []
-    for row in rows:
+    for row in visible:
         label = _SESSION_STATES.get(row["state"], "ожидает проверки")
         if row["state"] == "healthy" and row["checked_at"] < time.time() - 2 * wb_sessions.CHECK_INTERVAL:
             label = "давно не проверялась"
@@ -2301,7 +2325,7 @@ def _build_wb_sessions_view():
             InlineKeyboardButton(text=session_label + " · Проверить", callback_data="wbslot_check_" + sid),
             InlineKeyboardButton(text="Обновить", callback_data="wbslot_login_" + sid),
             InlineKeyboardButton(text="✅ Рабочая" if row["active"] else "Сделать рабочей",
-                                 callback_data="wb_sessions" if row["active"] else "wbslot_activate_" + sid),
+                                 callback_data=current_page if row["active"] else "wbslot_activate_" + sid),
         ])
     pause = recovery.cooldown_error(recovery.session_generation())
     if pause:
@@ -2313,11 +2337,11 @@ def _build_wb_sessions_view():
         counts = position_queue._store.counts()
         waiting = sum(n for state, n in counts.items() if state not in ("done", "cancelled"))
         lines.append(f"Заданий в очереди: {waiting}")
-    if len(rows) < wb_sessions.MAX_SESSIONS:
-        buttons.append([InlineKeyboardButton(text="➕ Добавить сессию", callback_data="wb_session_add")])
+    buttons.extend(_wb_sessions_navigation(page, pages, "wb_sessions_page_"))
+    buttons.append([InlineKeyboardButton(text="➕ Добавить сессию", callback_data="wb_session_add")])
     if any(not row["active"] for row in rows):
         buttons.append([InlineKeyboardButton(text="Удалить резервную сессию", callback_data="wb_session_delete_menu")])
-    buttons.append([InlineKeyboardButton(text="Обновить список", callback_data="wb_sessions"),
+    buttons.append([InlineKeyboardButton(text="Обновить список", callback_data=current_page),
                     InlineKeyboardButton(text="⬅️ Настройки", callback_data="go_settings")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -2347,7 +2371,7 @@ async def _begin_wb_login(callback, state, sid):
     await callback.answer()
 
 
-@router.callback_query(F.data.in_({"wb_sessions", "wb_session_update", "wb_session_add", "wb_session_delete_menu"}))
+@router.callback_query(F.data.regexp(r"^(?:wb_sessions|wb_session_(?:update|add|delete_menu)|wb_sessions_page_\d+|wb_session_delete_page_\d+)$"))
 async def wb_sessions_menu(callback: CallbackQuery, state: FSMContext):
     if not db.is_owner(callback.from_user.id):
         await callback.answer("Доступно только владельцу", show_alert=True)
@@ -2365,16 +2389,21 @@ async def wb_sessions_menu(callback: CallbackQuery, state: FSMContext):
         await _begin_wb_login(callback, state, sid)
         return
     await state.clear()
-    if callback.data == "wb_session_delete_menu":
+    page = int(callback.data.rsplit("_", 1)[1]) if "_page_" in callback.data else 0
+    if callback.data == "wb_session_delete_menu" or callback.data.startswith("wb_session_delete_page_"):
         reserves = [row for row in wb_sessions.list_sessions() if not row["active"]]
+        visible, page, pages = _wb_sessions_page(reserves, page)
         text = "Выбери резервную сессию для удаления." if reserves else "Резервных сессий для удаления нет."
+        if pages > 1:
+            text += f"\nСтраница {page + 1} из {pages}"
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             *[[InlineKeyboardButton(text="Удалить · " + _wb_session_label(row),
-                                   callback_data="wbslot_delete_" + row["id"])] for row in reserves],
+                                   callback_data="wbslot_delete_" + row["id"])] for row in visible],
+            *_wb_sessions_navigation(page, pages, "wb_session_delete_page_"),
             [InlineKeyboardButton(text="⬅️ WB-сессии", callback_data="wb_sessions")],
         ])
     else:
-        text, keyboard = _build_wb_sessions_view()
+        text, keyboard = _build_wb_sessions_view(page)
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
     except Exception as error:
@@ -2395,6 +2424,8 @@ async def wb_session_action(callback: CallbackQuery, state: FSMContext):
     if action == "login":
         await _begin_wb_login(callback, state, sid)
         return
+    page = next((index // _WB_SESSIONS_PAGE_SIZE for index, row in enumerate(wb_sessions.list_sessions())
+                 if row["id"] == sid), 0)
     await callback.answer("Выполняю…")
     try:
         if action == "delete":
@@ -2413,7 +2444,7 @@ async def wb_session_action(callback: CallbackQuery, state: FSMContext):
         result = "Сессия уже обслуживается. Повторите позже."
     except ValueError as error:
         result = str(error)
-    text, keyboard = _build_wb_sessions_view()
+    text, keyboard = _build_wb_sessions_view(page)
     await callback.message.edit_text(text + "\n" + escape(result), parse_mode="HTML", reply_markup=keyboard)
 
 
