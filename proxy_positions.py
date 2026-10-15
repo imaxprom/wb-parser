@@ -239,7 +239,7 @@ def _build_headers(token_key: str, with_bearer: bool = True, *, session_data=Non
 def _search_sync(headers: dict, params: dict, proxy_url: str = None,
                  session: curl_requests.Session = None) -> tuple[dict, dict | None]:
     try:
-        with wb_search_pacing.request_slot() as pacing:
+        with wb_search_pacing.request_slot(session_id=getattr(headers, "session_id", None)) as pacing:
             data, error = _search_unpaced_sync(headers, params, proxy_url, session, pacing=pacing)
             # Publish a rate/server pause before releasing the shared request
             # slot, so a waiting process cannot send the next request first.

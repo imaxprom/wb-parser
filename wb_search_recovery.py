@@ -94,7 +94,7 @@ def record_success(generation, started_at):
         if value["session"].get("saved_at", 0) == generation:
             row = next((s for s in wb_sessions.list_sessions() if s["active"]), None)
             if row and (row["state"] != "healthy" or row["checked_at"] < time.time() - 60):
-                wb_sessions.record_health(value, {"state": "healthy", "status": 200})
+                wb_sessions.record_health(value, {"state": "healthy", "status": 200, "started_at": started_at})
     if not _read(_state_path()).get("failures"):
         return False
     with (Path(config.DATA_DIR) / "wb_search_recovery.lock").open("a+") as lock:

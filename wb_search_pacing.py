@@ -1,6 +1,6 @@
 """Optional shared pacing of individual search requests across bot and RPC."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
 import fcntl
 from functools import wraps
@@ -127,7 +127,7 @@ class SearchPaused(Exception):
 
 
 @contextmanager
-def request_slot(*, recovery=False):
+def _serial_request_slot(*, recovery=False, force_pool=False):
     directory = Path(config.DATA_DIR)
     with (directory / "wb_search_request.lock").open("a+") as lock:
         from wb_search_recovery import cooldown_error, session_generation
@@ -147,6 +147,10 @@ def request_slot(*, recovery=False):
                 if not recovery or state_pause.get("server_delay"):
                     raise SearchPaused(pause)
             current = policy()
+            if force_pool:
+                current = current or {"name": "pool_serial50", "gap_ms": 50,
+                                      "batch_size": 1, "batch_pause_ms": 0, "experiment": False}
+                current = {**current, "gap_ms": max(50, current["gap_ms"])}
             if current is None:
                 yield None
                 return
@@ -170,9 +174,82 @@ def request_slot(*, recovery=False):
             yield current
         finally:
             new_state = {"last_finished_at": time.time(), "name": current["name"], "count": count + 1}
+            if force_pool:
+                new_state["last_legacy_finished_at"] = new_state["last_finished_at"]
             if scope:
                 new_state["clients"] = {**clients, scope: dict(new_state)}
             temporary = state_path.with_suffix(f".tmp.{os.getpid()}")
             temporary.write_text(json.dumps(new_state))
             os.chmod(temporary, 0o600)
             os.replace(temporary, state_path)
+
+
+@contextmanager
+def request_slot(*, recovery=False, session_id=None):
+    from wb_search_pool import settings
+    configured = settings()
+    if not configured or not isinstance(session_id, str) or not session_id.isalnum():
+        with _serial_request_slot(recovery=recovery, force_pool=bool(configured)) as current:
+            yield current
+        return
+    directory = Path(config.DATA_DIR)
+    accounts = directory / "search_accounts"
+    accounts.mkdir(exist_ok=True)
+    state_path = accounts / (session_id + ".json")
+    from wb_search_recovery import cooldown_error, session_generation
+    # Account lock covers the entire HTTP, including error publication. Three
+    # global permits also cap maintenance/standby requests to three in flight.
+    while True:
+        with ExitStack() as locks:
+            shared = locks.enter_context((directory / "wb_search_request.lock").open("a+"))
+            account = locks.enter_context((accounts / (session_id + ".lock")).open("a+"))
+            try:
+                fcntl.flock(shared, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock(account, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                permit = None
+                for index in range(3):
+                    handle = (accounts / f"capacity-{index}.lock").open("a+")
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        handle.close()
+                        continue
+                    permit = locks.enter_context(handle)
+                    break
+                if permit is None:
+                    raise BlockingIOError
+            except BlockingIOError:
+                pass
+            else:
+                pause = cooldown_error(session_generation())
+                if pause and (not recovery or _read(directory / "wb_search_recovery.json").get("server_delay")):
+                    raise SearchPaused(pause)
+                if client_name() in ("bot", "recovery") or not bot_priority_active():
+                    current = policy() or {"name": "pool_serial50", "gap_ms": 50,
+                                          "batch_size": 1, "batch_pause_ms": 0, "experiment": False}
+                    current = {**current, "gap_ms": max(50, current["gap_ms"])}
+                    own = _read(state_path)
+                    gap = current["gap_ms"] / 1000
+                    if own.get("count", 0) and own["count"] % current["batch_size"] == 0:
+                        gap = max(gap, current["batch_pause_ms"] / 1000)
+                    legacy = _read(directory / "wb_search_pacing_state.json")
+                    if max(own.get("last_finished_at", 0) + gap,
+                           legacy.get("last_legacy_finished_at", legacy.get("last_finished_at", 0)) + current["gap_ms"] / 1000) <= time.time():
+                        try:
+                            yield current
+                        finally:
+                            from wb_sessions import atomic_json
+                            update = {"last_finished_at": time.time(), "name": current["name"],
+                                      "count": own.get("count", 0) + 1}
+                            atomic_json(state_path, update)
+                            # The legacy exclusive gate must wait after our last
+                            # response too. Merge concurrent completions atomically.
+                            with (accounts / "state.lock").open("a+") as state_lock:
+                                fcntl.flock(state_lock, fcntl.LOCK_EX)
+                                path = directory / "wb_search_pacing_state.json"
+                                previous = _read(path)
+                                atomic_json(path, {**previous, "last_legacy_finished_at": previous.get(
+                                    "last_legacy_finished_at", previous.get("last_finished_at", 0)), "last_finished_at": max(
+                                    previous.get("last_finished_at", 0), update["last_finished_at"])})
+                        return
+        time.sleep(.01)

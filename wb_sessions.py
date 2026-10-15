@@ -349,18 +349,23 @@ def record_health(value, result, *, scope="search"):
                          (value["id"], value["revision"])).fetchone()
         if not row:
             return
+        observed = result.get("started_at")
+        if observed is not None and row["checked_at"] > observed:
+            return
         if scope == "cart":
-            db.execute("UPDATE sessions SET cart_state=?,cart_checked_at=? WHERE id=?",
-                       (state, time.time(), value["id"]))
+            db.execute("UPDATE sessions SET cart_state=?,cart_checked_at=? WHERE id=? AND revision=?",
+                       (state, time.time(), value["id"], value["revision"]))
             return
         failures = 0 if state == "healthy" else row["failures"] + 1
         delay = (config.WB_SEARCH_498_RETRY_SECONDS
                  if state == "antibot" and result.get("status") == 498
                  else min(900 * 2 ** min(failures - 1, 3), 7200))
         retry = 0 if state == "healthy" else time.time() + delay
-        db.execute("UPDATE sessions SET state=?,checked_at=?,success_at=?,status_code=?,failures=?,retry_at=? WHERE id=?",
+        changed = db.execute("UPDATE sessions SET state=?,checked_at=?,success_at=?,status_code=?,failures=?,retry_at=? WHERE id=? AND revision=? AND (? IS NULL OR checked_at=?)",
                    (state, time.time(), time.time() if state == "healthy" else row["success_at"],
-                    result.get("status"), failures, retry, value["id"]))
+                    result.get("status"), failures, retry, value["id"], value["revision"], observed, row["checked_at"]))
+        if not changed.rowcount:
+            return
         if state != row["state"] and state != "healthy":
             _event(db, value["id"], "unavailable", row["name"] + ": " + state)
 
@@ -391,11 +396,16 @@ def probe(value, *, emergency=False):
               "hide_dflags": "131072", "hide_dtype": "10;14", "inheritFilters": "false",
               "query": "трусы женские", "resultset": "catalog", "sort": "popular",
               "spp": "31", "suppressSpellcheck": "false", "limit": "100", "page": "1", "lang": "ru"}
+    started_at = time.time()
     try:
         with pacing.client_scope("recovery" if emergency else "maintenance"):
-            with pacing.request_slot(recovery=emergency) as policy:
+            with pacing.request_slot(recovery=emergency, session_id=value.get("id")) as policy:
+                started_at = time.time()
                 headers = positions._build_headers("__direct__", session_data=session)
                 data, error = positions._search_unpaced_sync(headers, params, pacing=policy)
+                if error and (error.get("error_state") == "rate_limited" or error.get("retry_after")):
+                    recovery.recover(error, recovery.session_generation(), allow_refresh=False)
+                    error["pause_registered"] = True
         if error:
             if error.get("error_state") == "rate_limited" or error.get("retry_after"):
                 recovery.recover(error, recovery.session_generation(), allow_refresh=False)
@@ -410,7 +420,7 @@ def probe(value, *, emergency=False):
         return {"state": "paused", "retry_after": exc.error.get("retry_after", 0)}
     except Exception:
         result = {"state": "network_error", "status": None}
-    record_health(value, result)
+    record_health(value, {**result, "started_at": started_at})
     return result
 
 
@@ -427,6 +437,12 @@ def failover(error, observed_generation, *, scope="search", validator=None):
     if scope != "search":
         candidates = [s for s in candidates if s["state"] == "healthy"]
     candidates.sort(key=lambda s: s["success_at"], reverse=True)
+    if scope == "search":
+        from wb_search_pool import settings
+        configured = settings()
+        if configured:
+            # The same explicit standby is preferred for the native bot path.
+            candidates.sort(key=lambda s: s["id"] not in configured["reserve"])
     limit = 1 if error.get("error_state") == "antibot" else MAX_FAILOVER_PROBES
     for candidate in candidates[:limit]:
         try:
