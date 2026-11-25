@@ -36,13 +36,13 @@ def client_name():
 
 
 def _priority_file():
-    path = Path(config.DATA_DIR) / "wb_search_bot_priority.lock"
+    path = Path(config.DATA_DIR) / "wb_search_rpc_priority.lock"
     return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "a+")
 
 
 def reserve_bot_priority():
-    """Reserve across requests; process exit also releases the reservation."""
-    if client_name() != "bot":
+    """Legacy API name: reserve priority for website RPC, never Telegram."""
+    if client_name() != "rpc":
         return None
     handle = _priority_file()
     try:
@@ -54,6 +54,7 @@ def reserve_bot_priority():
 
 
 def bot_priority_active():
+    """Legacy API name, also used by maintenance: website RPC has priority."""
     with _priority_file() as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -73,7 +74,7 @@ def bot_priority():
 
 
 def bot_priority_job(function):
-    """Keep priority across all articles and awaits of one Telegram check."""
+    """Keep Telegram's client profile; it no longer reserves search priority."""
     @wraps(function)
     async def wrapped(*args, **kwargs):
         with client_scope("bot"), bot_priority():
@@ -134,9 +135,8 @@ def _serial_request_slot(*, recovery=False, force_pool=False):
         state_path = directory / "wb_search_pacing_state.json"
         while True:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            if client_name() not in ("bot", "recovery") and bot_priority_active():
-                # The already admitted HTTP request may finish. No later
-                # website request starts until all bot reservations finish.
+            if client_name() not in ("rpc", "recovery") and bot_priority_active():
+                # Finish admitted HTTP, then let pending website RPC go first.
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
                 time.sleep(.05)
                 continue
@@ -186,6 +186,15 @@ def _serial_request_slot(*, recovery=False, force_pool=False):
 
 @contextmanager
 def request_slot(*, recovery=False, session_id=None):
+    # Reserve before waiting for the account/global permit, so a long Telegram
+    # check yields between HTTP requests. Exit/process death releases priority.
+    with bot_priority():
+        with _request_slot(recovery=recovery, session_id=session_id) as current:
+            yield current
+
+
+@contextmanager
+def _request_slot(*, recovery=False, session_id=None):
     from wb_search_pool import settings
     configured = settings()
     if not configured or not isinstance(session_id, str) or not session_id.isalnum():
@@ -224,7 +233,7 @@ def request_slot(*, recovery=False, session_id=None):
                 pause = cooldown_error(session_generation())
                 if pause and (not recovery or _read(directory / "wb_search_recovery.json").get("server_delay")):
                     raise SearchPaused(pause)
-                if client_name() in ("bot", "recovery") or not bot_priority_active():
+                if client_name() in ("rpc", "recovery") or not bot_priority_active():
                     current = policy() or {"name": "pool_serial50", "gap_ms": 50,
                                           "batch_size": 1, "batch_pause_ms": 0, "experiment": False}
                     current = {**current, "gap_ms": max(50, current["gap_ms"])}

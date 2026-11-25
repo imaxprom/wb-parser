@@ -43,7 +43,7 @@ class Task:
     label: str = ""  # e.g. SKU for logging
     pause_callbacks: list = field(default_factory=list)
     retry_at: float = 0
-    priority_handle: object = field(default=None, repr=False)
+    search_client: str | None = None
     job_id: str | None = None
     result: dict = field(default_factory=dict)
     restored: bool = False
@@ -109,7 +109,6 @@ class PositionQueue:
                 self._worker_task.cancel()
             self._worker_task = None
         for task in self._tasks.values():
-            self._release_priority(task)
             if not task.future.done():
                 task.future.cancel()
         self._tasks.clear()
@@ -129,7 +128,7 @@ class PositionQueue:
             if task is None or task.future.done():
                 task = Task(uid=uid, nm_id=nm_id, keywords=list(keywords),
                             future=loop.create_future(), label=label or str(nm_id),
-                            priority_handle=wb_search_pacing.reserve_bot_priority())
+                            search_client=wb_search_pacing.client_name())
                 if self._store:
                     task.job_id = self._store.add(uid, nm_id, keywords, task.label)
                 self._tasks[key] = task
@@ -253,12 +252,6 @@ class PositionQueue:
         """Total pending tasks across all users."""
         return sum(len(q) for q in self._user_queues.values())
 
-    @staticmethod
-    def _release_priority(task):
-        if task.priority_handle is not None:
-            task.priority_handle.close()
-            task.priority_handle = None
-
     def pending_for_user(self, uid: int) -> int:
         """Pending tasks for a specific user."""
         return len(self._user_queues.get(uid, []))
@@ -328,10 +321,8 @@ class PositionQueue:
             )
             retry_task = False
             try:
-                context = wb_search_pacing.client_scope("bot") if self._durable or task.priority_handle is not None else nullcontext()
+                context = wb_search_pacing.client_scope("bot") if self._durable or task.search_client == "bot" else nullcontext()
                 with context:
-                    if task.priority_handle is None:
-                        task.priority_handle = wb_search_pacing.reserve_bot_priority()
                     result = await self._execute(task)
                 if self._store:
                     self._store.save(task, "completed")
@@ -359,7 +350,6 @@ class PositionQueue:
                 elif not task.future.cancelled():
                     task.future.set_exception(e)
             finally:
-                self._release_priority(task)
                 if retry_task:
                     continue
                 self._tasks.pop((task.uid, task.nm_id, tuple(task.keywords)), None)

@@ -125,12 +125,12 @@ class ParallelTest(unittest.TestCase):
                     with pacing.request_slot(session_id=sid,recovery=emergency): self.fail('HTTP admitted')
         self.assertEqual(recovery._read(recovery._state_path()),before)
 
-    def test_bot_priority_blocks_pool_until_release(self):
+    def test_rpc_priority_blocks_bot_pool_until_release(self):
         entered=threading.Event()
         def worker():
-            with pacing.client_scope('rpc'),pacing.request_slot(session_id=self.ids[0]): entered.set()
+            with pacing.client_scope('bot'),pacing.request_slot(session_id=self.ids[0]): entered.set()
         with concurrent.futures.ThreadPoolExecutor(1) as executor:
-            with pacing.client_scope('bot'),pacing.bot_priority():
+            with pacing.client_scope('rpc'),pacing.bot_priority():
                 future=executor.submit(worker)
                 self.assertFalse(entered.wait(.15))
             future.result(3)

@@ -54,7 +54,7 @@ class QueueRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(not r["error"] for r in result.values()))
         callback.assert_awaited_once_with(deadline)
 
-    async def test_bot_priority_survives_cancelled_waiter_until_queued_work_finishes(self):
+    async def test_bot_context_survives_cancelled_waiter_without_reserving_priority(self):
         started,release=asyncio.Event(),asyncio.Event()
         async def fetch(*args):
             self.assertEqual(pacing.client_name(),'bot')
@@ -66,11 +66,11 @@ class QueueRecoveryTest(unittest.IsolatedAsyncioTestCase):
                 second=await self.queue.submit(1,123,['a'])
             await started.wait()
             first.cancel()
-            self.assertTrue(pacing.bot_priority_active())
+            self.assertFalse(pacing.bot_priority_active())
             release.set();await second
         self.assertFalse(pacing.bot_priority_active())
 
-    async def test_queue_shutdown_releases_pending_priority_reservations(self):
+    async def test_queue_shutdown_keeps_bot_tasks_without_priority_reservations(self):
         started=asyncio.Event()
         async def fetch(*args):
             started.set();await asyncio.sleep(100)
@@ -79,7 +79,7 @@ class QueueRecoveryTest(unittest.IsolatedAsyncioTestCase):
                 first=await self.queue.submit(1,123,['a'])
                 second=await self.queue.submit(2,456,['a'])
             await started.wait()
-            self.assertTrue(pacing.bot_priority_active())
+            self.assertFalse(pacing.bot_priority_active())
             self.queue._worker_task.cancel()
             with self.assertRaises(asyncio.CancelledError):await self.queue._worker_task
             self.queue._worker_task=None
